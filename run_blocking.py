@@ -45,6 +45,12 @@ if os.path.isdir(LEGACY_SRC):
     sys.path.insert(1, LEGACY_SRC)
 
 # ---------------------------------------------------------------------------
+# Hardcoded paths — update these if your layout changes.
+# ---------------------------------------------------------------------------
+DEFAULT_DATA_DIR   = "/content/ml-hack/student_resource/dataset"
+DEFAULT_OUTPUT_DIR = "/content/ml-hack/output"
+
+# ---------------------------------------------------------------------------
 # Dependency check + optional auto-install
 # ---------------------------------------------------------------------------
 REQUIRED = {
@@ -295,12 +301,12 @@ def parse_args():
     )
     parser.add_argument(
         "--data-dir",
-        default=os.path.join(SCRIPT_DIR, "dataset"),
+        default=DEFAULT_DATA_DIR,
         help="Root directory containing train/ and test/ sub-folders.",
     )
     parser.add_argument(
         "--output-dir",
-        default=os.path.join(SCRIPT_DIR, "output"),
+        default=DEFAULT_OUTPUT_DIR,
         help="Directory to write output parquet/tsv/summary files.",
     )
     parser.add_argument(

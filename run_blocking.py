@@ -54,7 +54,7 @@ if os.path.isdir(LEGACY_SRC):
 #       dataset/
 #         train/  test/
 # ---------------------------------------------------------------------------
-DEFAULT_DATA_DIR   = "/content/student_resource/dataset"
+DEFAULT_DATA_DIR   = "/content/ml-hack/student_resource/dataset"
 DEFAULT_OUTPUT_DIR = "/content/ml-hack/output"
 
 # ---------------------------------------------------------------------------

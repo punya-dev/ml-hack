@@ -1,0 +1,2 @@
+[console_scripts]
+jupyter-konsole = jupyter_kernel_client.konsoleapp:main

@@ -46,8 +46,15 @@ if os.path.isdir(LEGACY_SRC):
 
 # ---------------------------------------------------------------------------
 # Hardcoded paths — update these if your layout changes.
+# Colab layout:
+#   /content/
+#     ml-hack/          ← this script lives here
+#       src/, configs/, output/, ...
+#     student_resource/
+#       dataset/
+#         train/  test/
 # ---------------------------------------------------------------------------
-DEFAULT_DATA_DIR   = "/content/ml-hack/student_resource/dataset"
+DEFAULT_DATA_DIR   = "/content/student_resource/dataset"
 DEFAULT_OUTPUT_DIR = "/content/ml-hack/output"
 
 # ---------------------------------------------------------------------------

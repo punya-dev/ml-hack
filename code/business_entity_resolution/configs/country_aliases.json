@@ -1,0 +1,22 @@
+{
+  "aliases": {
+    "us": "US",
+    "usa": "US",
+    "u.s.": "US",
+    "u.s.a.": "US",
+    "united states": "US",
+    "united states of america": "US",
+    "in": "India",
+    "ind": "India",
+    "india": "India",
+    "bharat": "India",
+    "fr": "France",
+    "fra": "France",
+    "france": "France"
+  },
+  "canonical": [
+    "US",
+    "India",
+    "France"
+  ]
+}

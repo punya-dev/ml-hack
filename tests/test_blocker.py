@@ -5,6 +5,7 @@ import os
 import tempfile
 import pandas as pd
 import pytest
+from pipeline_raw_to_blocking import resolve_checkpoint_dir
 from src.blocker import CandidateBlocker
 
 
@@ -165,4 +166,64 @@ def test_mixed_raw_country_spellings_blocking():
     assert "S2-USA-MATCH" in candidates["S1-USA-TEST"], f"Failed to match USA pair across 'United States' and 'USA'. Got: {candidates['S1-USA-TEST']}"
     assert "S3-IND-MATCH" in candidates["S1-IND-TEST"], f"Failed to match India pair across 'Bharat' and 'IND'. Got: {candidates['S1-IND-TEST']}"
     assert "S2-FRA-MATCH" in candidates["S1-FRA-TEST"], f"Failed to match France pair across 'fr' and 'FRA'. Got: {candidates['S1-FRA-TEST']}"
+
+
+def test_blocker_checkpoint_can_be_saved_and_loaded(tmp_path):
+    s1 = pd.DataFrame([
+        {
+            "entity_id": "S1-100",
+            "business_name": "Acme Labs",
+            "business_address": "101 Main St, Boston, MA",
+            "country": "US",
+        },
+        {
+            "entity_id": "S1-101",
+            "business_name": "Bharat Tech",
+            "business_address": "MG Road, Pune, MH",
+            "country": "India",
+        },
+    ])
+    s2 = pd.DataFrame([
+        {
+            "entity_id": "S2-200",
+            "business_name": "Acme Labs Inc",
+            "business_address": "101 Main Street, Boston, Massachusetts",
+            "country": "USA",
+        }
+    ])
+    s3 = pd.DataFrame([
+        {
+            "entity_id": "S3-300",
+            "business_name": "Bharat Technology",
+            "business_address": "MG Road, Pune, Maharashtra",
+            "country": "IND",
+        }
+    ])
+
+    cache_dir = tmp_path / "checkpoint"
+    blocker = CandidateBlocker(fuzzy_threshold=0.30)
+
+    saved = blocker.save_stage_1_4_checkpoint(
+        s2_path=str(tmp_path / "s2.tsv"),
+        s3_path=str(tmp_path / "s3.tsv"),
+        cache_dir=str(cache_dir),
+        s2_chunk_size=500000,
+        s3_chunk_size=500000,
+    )
+
+    assert saved is True
+    assert (cache_dir / "stages_1_to_4.pkl").exists()
+
+    loaded = blocker.load_stage_1_4_checkpoint(str(cache_dir))
+    assert loaded is not None
+    assert "indexes" in loaded
+    assert "country_models" in loaded
+
+
+def test_pipeline_checkpoint_dir_is_mode_specific(tmp_path):
+    base = str(tmp_path / "cached_checkpoints")
+
+    assert resolve_checkpoint_dir(base, "train") == os.path.join(base, "train")
+    assert resolve_checkpoint_dir(base, "val") == os.path.join(base, "val")
+    assert resolve_checkpoint_dir(base, "train") != resolve_checkpoint_dir(base, "val")
 

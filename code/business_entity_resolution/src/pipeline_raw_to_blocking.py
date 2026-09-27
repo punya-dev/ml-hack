@@ -70,6 +70,13 @@ CODE_DIR = os.path.join(PROJECT_ROOT, "code", "business_entity_resolution")
 SRC_DIR = os.path.join(CODE_DIR, "src")
 ROOT_SRC = os.path.join(PROJECT_ROOT, "src")
 
+
+def resolve_checkpoint_dir(base_dir: Optional[str], mode: str) -> str:
+    """Use a mode-specific checkpoint folder to prevent train/val/test cache leakage."""
+    base = base_dir or os.path.join(detect_output_dir(), "checkpoints")
+    return os.path.join(base, mode)
+
+
 # Prepend all candidate source directories to sys.path
 for p in [SRC_DIR, ROOT_SRC, SCRIPT_DIR, REAL_SCRIPT_DIR, CODE_DIR, PROJECT_ROOT]:
     if os.path.isdir(p) and p not in sys.path:
@@ -229,6 +236,7 @@ def run_stage_blocking(
     max_total: int,
     n_jobs: Optional[int] = None,
     skip_audit: bool = False,
+    checkpoint_dir: Optional[str] = None,
 ):
     detected_cores = os.cpu_count() or 4
     eff_n_jobs = n_jobs if n_jobs is not None else detected_cores
@@ -305,6 +313,7 @@ def run_stage_blocking(
         chunk_size=chunk_size,
         ground_truth_path=gt,
         verbose=True,
+        checkpoint_dir=checkpoint_dir,
     )
     elapsed = time.time() - t0
 
@@ -497,6 +506,12 @@ def parse_args():
         default=False,
         help="Skip post-hoc recall audit against ground truth.",
     )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Directory to save and reuse the cached Stage 1-4 blocking state when changing workers or chunk settings.",
+    )
     return parser.parse_args()
 
 
@@ -543,7 +558,10 @@ def main():
     else:  # all
         modes = ["train", "val", "test"]
 
+    checkpoint_base = args.checkpoint_dir or os.path.join(args.output_dir, "checkpoints")
+
     for m in modes:
+        mode_checkpoint_dir = resolve_checkpoint_dir(checkpoint_base, m)
         run_stage_blocking(
             mode=m,
             data_dir=args.data_dir,
@@ -554,6 +572,7 @@ def main():
             max_total=args.max_total,
             n_jobs=args.n_jobs,
             skip_audit=args.skip_audit,
+            checkpoint_dir=mode_checkpoint_dir,
         )
 
     total_time = time.time() - t_pipeline_start

@@ -19,6 +19,7 @@ import os
 import sys
 import gc
 import time
+import pickle
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Optional, Any
 import pandas as pd
@@ -56,6 +57,14 @@ CANDIDATE_PA_SCHEMA = pa.schema([
     ("exact_ch6_address_tokens", pa.int8()),
     ("tfidf_cosine_score", pa.float32()),
 ])
+
+
+def _get_line_count(fpath: str) -> Optional[int]:
+    try:
+        with open(fpath, "rb") as f:
+            return sum(1 for _ in f) - 1
+    except Exception:
+        return None
 
 
 def _process_fuzzy_subchunk(
@@ -618,6 +627,162 @@ class CandidateBlocker:
             for s1_id, cands in candidates.items():
                 f.write(f"{s1_id}\t{','.join(cands)}\n")
 
+    def _prepare_stage_1_4_state(
+        self,
+        s2_path: str,
+        s3_path: str,
+        ground_truth_path: Optional[str] = None,
+        s2_chunk_size: int = 500000,
+        s3_chunk_size: int = 500000,
+    ) -> Dict[str, Any]:
+        """Build the cached stage-1-to-stage-4 state used by the blocker."""
+        indexes = {
+            "core_name": defaultdict(list),
+            "sorted_tokens": defaultdict(list),
+            "state_pfx": defaultdict(list),
+            "state_phon": defaultdict(list),
+            "acronym": defaultdict(list),
+            "sorted_addr": defaultdict(list),
+        }
+        country_texts = defaultdict(list)
+        country_eids = defaultdict(list)
+
+        def _get_line_count(fpath: str) -> Optional[int]:
+            try:
+                with open(fpath, "rb") as f:
+                    return sum(1 for _ in f) - 1
+            except Exception:
+                return None
+
+        total_s2_lines = _get_line_count(s2_path)
+        s2_chunks_est = ((total_s2_lines + s2_chunk_size - 1) // s2_chunk_size) if total_s2_lines else None
+        print(f"\n[Step 1/5] Ingesting and indexing Source 2 candidate pool in streaming chunks (using {self.n_jobs} CPU cores for parallel preprocessing)...", flush=True)
+        t0 = time.time()
+        total_s2 = 0
+        pbar_s2 = tqdm(total=s2_chunks_est, desc="Step 1/5: Ingesting S2", unit="chunk", file=sys.stdout, dynamic_ncols=True)
+        for s2_chunk in pd.read_csv(s2_path, sep="\t", chunksize=s2_chunk_size):
+            total_s2 += len(s2_chunk)
+            s2_prep = self.preprocess_df(s2_chunk, n_jobs=self.n_jobs)
+            self.index_candidate_chunk(s2_prep, indexes)
+            for ctry, grp in s2_prep.groupby("country"):
+                country_eids[ctry].extend(grp["entity_id"].tolist())
+                country_texts[ctry].extend(grp["search_text"].tolist())
+            del s2_chunk, s2_prep
+            gc.collect()
+            pbar_s2.update(1)
+        pbar_s2.close()
+        print(f"  Ingested {total_s2:,} S2 records in {time.time() - t0:.2f}s using {self.n_jobs} CPU cores.", flush=True)
+
+        total_s3_lines = _get_line_count(s3_path)
+        s3_chunks_est = ((total_s3_lines + s3_chunk_size - 1) // s3_chunk_size) if total_s3_lines else None
+        print(f"\n[Step 2/5] Ingesting and indexing Source 3 candidate pool in streaming chunks (using {self.n_jobs} CPU cores for parallel preprocessing)...", flush=True)
+        t0 = time.time()
+        total_s3 = 0
+        pbar_s3 = tqdm(total=s3_chunks_est, desc="Step 2/5: Ingesting S3", unit="chunk", file=sys.stdout, dynamic_ncols=True)
+        for s3_chunk in pd.read_csv(s3_path, sep="\t", chunksize=s3_chunk_size):
+            total_s3 += len(s3_chunk)
+            s3_prep = self.preprocess_df(s3_chunk, n_jobs=self.n_jobs)
+            self.index_candidate_chunk(s3_prep, indexes)
+            for ctry, grp in s3_prep.groupby("country"):
+                country_eids[ctry].extend(grp["entity_id"].tolist())
+                country_texts[ctry].extend(grp["search_text"].tolist())
+            del s3_chunk, s3_prep
+            gc.collect()
+            pbar_s3.update(1)
+        pbar_s3.close()
+        print(f"  Ingested {total_s3:,} S3 records in {time.time() - t0:.2f}s using {self.n_jobs} CPU cores.", flush=True)
+        print(f"  Total candidate pool: {total_s2 + total_s3:,} entities indexed across 6 inverted index channels.", flush=True)
+
+        print(f"\n[Step 3/5] Fitting country-partitioned TF-IDF matrices over candidate pool (using {self.n_jobs} CPU cores)...", flush=True)
+        t0 = time.time()
+        country_models = {}
+        for ctry in list(country_texts.keys()):
+            texts = country_texts[ctry]
+            eids_arr = np.array(country_eids[ctry])
+            del country_eids[ctry]
+
+            min_df_val = 1 if len(texts) < 10 else 2
+            vectorizer = TfidfVectorizer(
+                analyzer="char_wb",
+                ngram_range=self.ngram_range,
+                min_df=min_df_val,
+                sublinear_tf=True,
+                dtype=np.float32,
+            )
+            X_other = vectorizer.fit_transform(texts)
+            n_records = X_other.shape[0]
+            n_features = X_other.shape[1]
+            nnz = X_other.nnz
+            del texts, country_texts[ctry]
+            gc.collect()
+            X_other_T = X_other.T.tocsr()
+            del X_other
+            gc.collect()
+            country_models[ctry] = (vectorizer, X_other_T, eids_arr)
+            print(f"  Country '{ctry}': {n_records:,} records, {n_features:,} features, {nnz:,} non-zeros (pre-transposed).", flush=True)
+
+        print(f"  All TF-IDF matrices built in {time.time() - t0:.2f}s using {self.n_jobs} CPU cores.", flush=True)
+        del country_texts, country_eids
+        gc.collect()
+
+        gt_map = {}
+        total_gt_pairs = 0
+        if ground_truth_path and os.path.exists(ground_truth_path):
+            print(f"\n[Step 4/5] Loading ground truth pairs for real-time recall ceiling tracking (using 1 CPU core - I/O bound)...", flush=True)
+            t0 = time.time()
+            gt_df = pd.read_csv(ground_truth_path, sep="\t")
+            match_col = "matched_entity_ids" if "matched_entity_ids" in gt_df.columns else "matched_entity_id"
+            for _, row in gt_df.iterrows():
+                if pd.isna(row[match_col]):
+                    continue
+                s1_id = row["source1_entity_id"]
+                matches = {m.strip() for m in str(row[match_col]).split(",") if m.strip() and m.strip() != "nan"}
+                if matches:
+                    gt_map[s1_id] = matches
+                    total_gt_pairs += len(matches)
+            del gt_df
+            gc.collect()
+            print(f"  Loaded {len(gt_map):,} true S1 matches ({total_gt_pairs:,} total true pairs) in {time.time() - t0:.2f}s.", flush=True)
+
+        return {
+            "indexes": indexes,
+            "country_models": country_models,
+            "ground_truth": gt_map,
+            "total_gt_pairs": total_gt_pairs,
+        }
+
+    def save_stage_1_4_checkpoint(
+        self,
+        s2_path: str,
+        s3_path: str,
+        cache_dir: str,
+        s2_chunk_size: int = 500000,
+        s3_chunk_size: int = 500000,
+        ground_truth_path: Optional[str] = None,
+    ) -> bool:
+        """Persist the stage 1-4 blocking state for reuse when only worker settings change."""
+        os.makedirs(cache_dir, exist_ok=True)
+        state = self._prepare_stage_1_4_state(
+            s2_path=s2_path,
+            s3_path=s3_path,
+            ground_truth_path=ground_truth_path,
+            s2_chunk_size=s2_chunk_size,
+            s3_chunk_size=s3_chunk_size,
+        )
+        checkpoint_path = os.path.join(cache_dir, "stages_1_to_4.pkl")
+        with open(checkpoint_path, "wb") as f:
+            pickle.dump(state, f)
+        print(f"  Saved checkpoint to: {checkpoint_path}")
+        return True
+
+    def load_stage_1_4_checkpoint(self, cache_dir: str) -> Optional[Dict[str, Any]]:
+        """Load a persisted stage 1-4 checkpoint if it exists."""
+        checkpoint_path = os.path.join(cache_dir, "stages_1_to_4.pkl")
+        if not os.path.exists(checkpoint_path):
+            return None
+        with open(checkpoint_path, "rb") as f:
+            return pickle.load(f)
+
     def run_batched_blocking(
         self,
         s1_path: str,
@@ -628,6 +793,7 @@ class CandidateBlocker:
         chunk_size: int = 100000,
         ground_truth_path: Optional[str] = None,
         verbose: bool = True,
+        checkpoint_dir: Optional[str] = None,
     ):
         """
         Run full-scale candidate blocking with streaming ParquetWriter and TSV export.
@@ -648,126 +814,32 @@ class CandidateBlocker:
         print(f"  Parallelization : Multi-processing (loky) for text preprocessing | Multi-threaded BLAS for TF-IDF")
         print("=" * 80)
 
-        # 1. Initialize exact inverted indexes
-        indexes = {
-            "core_name": defaultdict(list),
-            "sorted_tokens": defaultdict(list),
-            "state_pfx": defaultdict(list),
-            "state_phon": defaultdict(list),
-            "acronym": defaultdict(list),
-            "sorted_addr": defaultdict(list),
-        }
+        checkpoint_path = None
+        if checkpoint_dir:
+            checkpoint_path = os.path.join(checkpoint_dir, "stages_1_to_4.pkl")
 
-        # Structures for fitting TF-IDF per country
-        country_texts = defaultdict(list)
-        country_eids = defaultdict(list)
-
-        # Ingestion chunk size for candidate pool (500k at a time to keep RAM minimal)
-        INGEST_CHUNK = 500000
-
-        def _get_line_count(fpath: str) -> Optional[int]:
-            try:
-                with open(fpath, "rb") as f:
-                    return sum(1 for _ in f) - 1
-            except Exception:
-                return None
-
-        total_s2_lines = _get_line_count(s2_path)
-        s2_chunks_est = ((total_s2_lines + INGEST_CHUNK - 1) // INGEST_CHUNK) if total_s2_lines else None
-
-        print(f"\n[Step 1/5] Ingesting and indexing Source 2 candidate pool in streaming chunks (using {self.n_jobs} CPU cores for parallel preprocessing)...", flush=True)
-        t0 = time.time()
-        total_s2 = 0
-        pbar_s2 = tqdm(total=s2_chunks_est, desc="Step 1/5: Ingesting S2", unit="chunk", file=sys.stdout, dynamic_ncols=True)
-        for s2_chunk in pd.read_csv(s2_path, sep="\t", chunksize=INGEST_CHUNK):
-            total_s2 += len(s2_chunk)
-            s2_prep = self.preprocess_df(s2_chunk, n_jobs=self.n_jobs)
-            self.index_candidate_chunk(s2_prep, indexes)
-            for ctry, grp in s2_prep.groupby("country"):
-                country_eids[ctry].extend(grp["entity_id"].tolist())
-                country_texts[ctry].extend(grp["search_text"].tolist())
-            del s2_chunk, s2_prep
-            gc.collect()
-            pbar_s2.update(1)
-        pbar_s2.close()
-        print(f"  Ingested {total_s2:,} S2 records in {time.time() - t0:.2f}s using {self.n_jobs} CPU cores.", flush=True)
-
-        total_s3_lines = _get_line_count(s3_path)
-        s3_chunks_est = ((total_s3_lines + INGEST_CHUNK - 1) // INGEST_CHUNK) if total_s3_lines else None
-
-        print(f"\n[Step 2/5] Ingesting and indexing Source 3 candidate pool in streaming chunks (using {self.n_jobs} CPU cores for parallel preprocessing)...", flush=True)
-        t0 = time.time()
-        total_s3 = 0
-        pbar_s3 = tqdm(total=s3_chunks_est, desc="Step 2/5: Ingesting S3", unit="chunk", file=sys.stdout, dynamic_ncols=True)
-        for s3_chunk in pd.read_csv(s3_path, sep="\t", chunksize=INGEST_CHUNK):
-            total_s3 += len(s3_chunk)
-            s3_prep = self.preprocess_df(s3_chunk, n_jobs=self.n_jobs)
-            self.index_candidate_chunk(s3_prep, indexes)
-            for ctry, grp in s3_prep.groupby("country"):
-                country_eids[ctry].extend(grp["entity_id"].tolist())
-                country_texts[ctry].extend(grp["search_text"].tolist())
-            del s3_chunk, s3_prep
-            gc.collect()
-            pbar_s3.update(1)
-        pbar_s3.close()
-        print(f"  Ingested {total_s3:,} S3 records in {time.time() - t0:.2f}s using {self.n_jobs} CPU cores.", flush=True)
-        print(f"  Total candidate pool: {total_s2 + total_s3:,} entities indexed across 6 inverted index channels.", flush=True)
-
-        print(f"\n[Step 3/5] Fitting country-partitioned TF-IDF matrices over candidate pool (using {self.n_jobs} CPU cores)...", flush=True)
-        t0 = time.time()
-        country_models = {}
-        for ctry in list(country_texts.keys()):
-            texts = country_texts[ctry]
-            eids_arr = np.array(country_eids[ctry])
-            # Free raw id list
-            del country_eids[ctry]
-
-            min_df_val = 1 if len(texts) < 10 else 2
-            vectorizer = TfidfVectorizer(
-                analyzer="char_wb",
-                ngram_range=self.ngram_range,
-                min_df=min_df_val,
-                sublinear_tf=True,
-                dtype=np.float32,
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            print(f"\n[Checkpoint] Loading cached stage 1-4 state from {checkpoint_path}")
+            state = self.load_stage_1_4_checkpoint(checkpoint_dir)
+            indexes = state["indexes"]
+            country_models = state["country_models"]
+            gt_map = state.get("ground_truth", {})
+            total_gt_pairs = int(state.get("total_gt_pairs", 0))
+        else:
+            state = self._prepare_stage_1_4_state(
+                s2_path=s2_path,
+                s3_path=s3_path,
+                ground_truth_path=ground_truth_path,
             )
-            X_other = vectorizer.fit_transform(texts)
-            n_records = X_other.shape[0]
-            n_features = X_other.shape[1]
-            nnz = X_other.nnz
-            del texts, country_texts[ctry]
-            gc.collect()
-
-            # Precompute transposed matrix once so we never transpose inside the loop!
-            X_other_T = X_other.T.tocsr()
-            del X_other
-            gc.collect()
-
-            country_models[ctry] = (vectorizer, X_other_T, eids_arr)
-            print(f"  Country '{ctry}': {n_records:,} records, {n_features:,} features, {nnz:,} non-zeros (pre-transposed).", flush=True)
-
-        print(f"  All TF-IDF matrices built in {time.time() - t0:.2f}s using {self.n_jobs} CPU cores.", flush=True)
-        del country_texts, country_eids
-        gc.collect()
-
-        # Load ground truth for streaming recall tracking if provided
-        gt_map = {}
-        total_gt_pairs = 0
-        if ground_truth_path and os.path.exists(ground_truth_path):
-            print(f"\n[Step 4/5] Loading ground truth pairs for real-time recall ceiling tracking (using 1 CPU core - I/O bound)...", flush=True)
-            t0 = time.time()
-            gt_df = pd.read_csv(ground_truth_path, sep="\t")
-            match_col = "matched_entity_ids" if "matched_entity_ids" in gt_df.columns else "matched_entity_id"
-            for _, row in gt_df.iterrows():
-                if pd.isna(row[match_col]):
-                    continue
-                s1_id = row["source1_entity_id"]
-                matches = {m.strip() for m in str(row[match_col]).split(",") if m.strip() and m.strip() != "nan"}
-                if matches:
-                    gt_map[s1_id] = matches
-                    total_gt_pairs += len(matches)
-            del gt_df
-            gc.collect()
-            print(f"  Loaded {len(gt_map):,} true S1 matches ({total_gt_pairs:,} total true pairs) in {time.time() - t0:.2f}s.", flush=True)
+            indexes = state["indexes"]
+            country_models = state["country_models"]
+            gt_map = state.get("ground_truth", {})
+            total_gt_pairs = int(state.get("total_gt_pairs", 0))
+            if checkpoint_dir:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                with open(checkpoint_path, "wb") as f:
+                    pickle.dump(state, f)
+                print(f"  Saved checkpoint to: {checkpoint_path}")
 
         # Prepare streaming output writers
         os.makedirs(os.path.dirname(os.path.abspath(output_parquet)), exist_ok=True)

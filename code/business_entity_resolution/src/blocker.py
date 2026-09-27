@@ -232,12 +232,12 @@ class CandidateBlocker:
                     for eid in matches:
                         s1_map[eid] |= 2
 
-            # 3. State + Prefix key (cap broad buckets at 50)
+            # 3. State + Prefix key
             if r.prefix_key and len(r.prefix_key) >= 4:
                 pfx4 = r.prefix_key[:4]
                 if r.state:
                     matches = idx_state_pfx.get((ctry, r.state, pfx4))
-                    if matches and len(matches) <= 50:
+                    if matches:
                         for eid in matches:
                             s1_map[eid] |= 4
                     missing_pfx = idx_state_pfx.get((ctry, "", pfx4))
@@ -250,11 +250,11 @@ class CandidateBlocker:
                         for eid in matches:
                             s1_map[eid] |= 4
 
-            # 4. State + Phonetic key (cap broad buckets at 50)
+            # 4. State + Phonetic key
             if r.phonetic_key:
                 if r.state:
                     matches = idx_state_phon.get((ctry, r.state, r.phonetic_key))
-                    if matches and len(matches) <= 50:
+                    if matches:
                         for eid in matches:
                             s1_map[eid] |= 8
                     missing_phon = idx_state_phon.get((ctry, "", r.phonetic_key))
@@ -267,17 +267,17 @@ class CandidateBlocker:
                         for eid in matches:
                             s1_map[eid] |= 8
 
-            # 5. Acronym key (cap broad buckets at 50)
+            # 5. Acronym key
             if r.acronym_key and len(r.acronym_key) >= 3:
                 matches = idx_acronym.get((ctry, r.acronym_key))
-                if matches and len(matches) <= 50:
+                if matches:
                     for eid in matches:
                         s1_map[eid] |= 16
 
-            # 6. Sorted address tokens (cap broad buckets at 100)
+            # 6. Sorted address tokens
             if r.sorted_address_tokens and len(r.sorted_address_tokens) >= 5:
                 matches = idx_sorted_addr.get((ctry, r.sorted_address_tokens))
-                if matches and len(matches) <= 100:
+                if matches:
                     for eid in matches:
                         s1_map[eid] |= 32
 
@@ -287,12 +287,11 @@ class CandidateBlocker:
         self,
         s1_batch_df: pd.DataFrame,
         country_models: Dict[str, Tuple[TfidfVectorizer, sp.csr_matrix, np.ndarray]],
-        chunk_size: int = 50,
+        chunk_size: int = 1000,
     ) -> Dict[str, List[Tuple[str, float]]]:
         """
         Query country-partitioned TF-IDF matrices for a batch of S1 records.
-        Returns dict: s1_id -> list of (cand_eid, cosine_score).
-        Uses smaller sub-chunks (default 50) to prevent intermediate sparse matrix RAM spikes.
+        Returns dict: s1_id -> list of (cand_eid, cosine_score)
         """
         fuzzy_candidates = defaultdict(list)
 
@@ -340,10 +339,6 @@ class CandidateBlocker:
                     for c_idx, sc in zip(selected_cols, selected_scores):
                         fuzzy_candidates[s1_id].append((other_ids[c_idx], float(sc)))
 
-                del batch_s1, sim_chunk
-
-            del X_s1
-
         return fuzzy_candidates
 
     def assemble_candidate_rows(
@@ -367,17 +362,11 @@ class CandidateBlocker:
 
             fuzzy_score_map = {cand_id: score for cand_id, score in s1_fuzzy}
 
-            # 1. Exact candidates (prioritized; sorted by channel count and capped at max_total)
+            # 1. Exact candidates (always prioritized)
             seen_cands = set()
             selected_cands = []
 
-            exact_items = sorted(
-                s1_exact.items(),
-                key=lambda item: (bin(item[1]).count("1"), fuzzy_score_map.get(item[0], 0.0)),
-                reverse=True,
-            )
-
-            for cand_id, mask in exact_items:
+            for cand_id, mask in s1_exact.items():
                 seen_cands.add(cand_id)
                 f_score = fuzzy_score_map.get(cand_id, 0.0)
                 selected_cands.append((
@@ -385,8 +374,6 @@ class CandidateBlocker:
                     mask,
                     f_score
                 ))
-                if len(selected_cands) >= self.max_total_candidates_per_s1:
-                    break
 
             # 2. Fill remaining slots with top fuzzy matches
             if s1_fuzzy and len(selected_cands) < self.max_total_candidates_per_s1:
@@ -436,186 +423,6 @@ class CandidateBlocker:
 
         return rows
 
-    def assemble_candidate_table(
-        self,
-        s1_prep: pd.DataFrame,
-        exact_candidates: Dict[str, Dict[str, int]],
-        fuzzy_candidates: Dict[str, List[Tuple[str, float]]],
-    ) -> Tuple[pa.Table, int, int, Dict[str, List[str]], Dict[str, List[int]]]:
-        """
-        Assemble candidate pairs directly into PyArrow Table via columnar arrays.
-        Avoids creating millions of intermediate Python dicts or DataFrames.
-        """
-        col_s1_id = []
-        col_cand_id = []
-        col_cand_src = []
-        col_country = []
-        col_ch1 = []
-        col_ch2 = []
-        col_ch3 = []
-        col_ch4 = []
-        col_ch5 = []
-        col_ch6 = []
-        col_score = []
-
-        n_pairs = 0
-        n_zeros = 0
-        cand_grouped = {}
-        batch_ctry_stats = defaultdict(lambda: [0, 0])
-
-        for r in s1_prep.itertuples(index=False):
-            s1_id = r.entity_id
-            ctry = r.country
-
-            s1_exact = exact_candidates.get(s1_id, {})
-            s1_fuzzy = fuzzy_candidates.get(s1_id, [])
-
-            fuzzy_score_map = {cand_id: score for cand_id, score in s1_fuzzy}
-
-            # 1. Exact candidates (prioritized; sorted by channel count and capped at max_total)
-            seen_cands = set()
-            selected_cands = []
-
-            exact_items = sorted(
-                s1_exact.items(),
-                key=lambda item: (bin(item[1]).count("1"), fuzzy_score_map.get(item[0], 0.0)),
-                reverse=True,
-            )
-
-            for cand_id, mask in exact_items:
-                seen_cands.add(cand_id)
-                f_score = fuzzy_score_map.get(cand_id, 0.0)
-                selected_cands.append((
-                    cand_id,
-                    mask,
-                    f_score
-                ))
-                if len(selected_cands) >= self.max_total_candidates_per_s1:
-                    break
-
-            # 2. Fill remaining slots with top fuzzy matches
-            if s1_fuzzy and len(selected_cands) < self.max_total_candidates_per_s1:
-                sorted_fuzzy = sorted(s1_fuzzy, key=lambda x: x[1], reverse=True)
-                for cand_id, score in sorted_fuzzy:
-                    if cand_id not in seen_cands:
-                        seen_cands.add(cand_id)
-                        selected_cands.append((
-                            cand_id,
-                            0,
-                            score
-                        ))
-                        if len(selected_cands) >= self.max_total_candidates_per_s1:
-                            break
-
-            # 3. Sentinel row if 0 candidates
-            if not selected_cands:
-                n_zeros += 1
-                batch_ctry_stats[ctry][1] += 1
-                cand_grouped[s1_id] = []
-                col_s1_id.append(s1_id)
-                col_cand_id.append(None)
-                col_cand_src.append(None)
-                col_country.append(ctry)
-                col_ch1.append(0)
-                col_ch2.append(0)
-                col_ch3.append(0)
-                col_ch4.append(0)
-                col_ch5.append(0)
-                col_ch6.append(0)
-                col_score.append(0.0)
-            else:
-                cands_list = []
-                for cand_id, mask, score in selected_cands:
-                    n_pairs += 1
-                    batch_ctry_stats[ctry][0] += 1
-                    cand_src = "S2" if cand_id.startswith("S2") else "S3"
-                    cands_list.append(cand_id)
-
-                    col_s1_id.append(s1_id)
-                    col_cand_id.append(cand_id)
-                    col_cand_src.append(cand_src)
-                    col_country.append(ctry)
-                    col_ch1.append(1 if (mask & 1) else 0)
-                    col_ch2.append(1 if (mask & 2) else 0)
-                    col_ch3.append(1 if (mask & 4) else 0)
-                    col_ch4.append(1 if (mask & 8) else 0)
-                    col_ch5.append(1 if (mask & 16) else 0)
-                    col_ch6.append(1 if (mask & 32) else 0)
-                    col_score.append(float(score))
-
-                cand_grouped[s1_id] = cands_list
-
-        table = pa.Table.from_arrays([
-            pa.array(col_s1_id, type=pa.string()),
-            pa.array(col_cand_id, type=pa.string()),
-            pa.array(col_cand_src, type=pa.string()),
-            pa.array(col_country, type=pa.string()),
-            pa.array(col_ch1, type=pa.int8()),
-            pa.array(col_ch2, type=pa.int8()),
-            pa.array(col_ch3, type=pa.int8()),
-            pa.array(col_ch4, type=pa.int8()),
-            pa.array(col_ch5, type=pa.int8()),
-            pa.array(col_ch6, type=pa.int8()),
-            pa.array(col_score, type=pa.float32()),
-        ], schema=CANDIDATE_PA_SCHEMA)
-
-        return table, n_pairs, n_zeros, cand_grouped, batch_ctry_stats
-
-    def generate_candidate_pairs(
-        self, s1_df: pd.DataFrame, other_df: pd.DataFrame, verbose: bool = False
-    ) -> Dict[str, List[str]]:
-        """
-        In-memory candidate generation for testing or small DataFrames.
-        Returns dict: s1_id -> list of candidate entity_ids.
-        """
-        indexes = {
-            "core_name": defaultdict(list),
-            "sorted_tokens": defaultdict(list),
-            "state_pfx": defaultdict(list),
-            "state_phon": defaultdict(list),
-            "acronym": defaultdict(list),
-            "sorted_addr": defaultdict(list),
-        }
-        country_texts = defaultdict(list)
-        country_eids = defaultdict(list)
-
-        other_prep = self.preprocess_df(other_df)
-        self.index_candidate_chunk(other_prep, indexes)
-        for ctry, grp in other_prep.groupby("country"):
-            country_eids[ctry].extend(grp["entity_id"].tolist())
-            country_texts[ctry].extend(grp["search_text"].tolist())
-
-        country_models = {}
-        for ctry in country_texts:
-            texts = country_texts[ctry]
-            eids_arr = np.array(country_eids[ctry])
-            min_df_val = 1 if len(texts) < 10 else 2
-            vectorizer = TfidfVectorizer(
-                analyzer="char_wb",
-                ngram_range=self.ngram_range,
-                min_df=min_df_val,
-                sublinear_tf=True,
-                dtype=np.float32,
-            )
-            X_other = vectorizer.fit_transform(texts)
-            country_models[ctry] = (vectorizer, X_other, eids_arr)
-
-        s1_prep = self.preprocess_df(s1_df)
-        exact_cands = self.retrieve_exact_candidates(s1_prep, indexes)
-        self.last_exact_candidates = {s1_id: set(cands.keys()) for s1_id, cands in exact_cands.items()}
-        fuzzy_cands = self.retrieve_fuzzy_candidates_for_batch(s1_prep, country_models, chunk_size=50)
-
-        _, _, _, cand_grouped, _ = self.assemble_candidate_table(s1_prep, exact_cands, fuzzy_cands)
-        return cand_grouped
-
-    @staticmethod
-    def save_candidate_pairs(candidates: Dict[str, List[str]], output_path: str):
-        """Save candidates dictionary to submission-ready TSV."""
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("source1_entity_id\tcandidate_entity_ids\n")
-            for s1_id, cands in candidates.items():
-                f.write(f"{s1_id}\t{','.join(cands)}\n")
-
     def run_batched_blocking(
         self,
         s1_path: str,
@@ -623,9 +430,8 @@ class CandidateBlocker:
         s3_path: str,
         output_parquet: str,
         output_tsv: Optional[str] = None,
-        chunk_size: int = 10000,
+        chunk_size: int = 50000,
         ground_truth_path: Optional[str] = None,
-        track_in_flight_gt: bool = False,
         verbose: bool = True,
     ):
         """
@@ -718,28 +524,25 @@ class CandidateBlocker:
         del country_texts, country_eids
         gc.collect()
 
-        # Load ground truth for streaming recall tracking if requested
+        # Load ground truth for streaming recall tracking if provided
         gt_map = {}
         total_gt_pairs = 0
         if ground_truth_path and os.path.exists(ground_truth_path):
-            if track_in_flight_gt:
-                print(f"\n[Step 4/5] Loading ground truth pairs for real-time recall ceiling tracking...")
-                t0 = time.time()
-                gt_df = pd.read_csv(ground_truth_path, sep="\t")
-                match_col = "matched_entity_ids" if "matched_entity_ids" in gt_df.columns else "matched_entity_id"
-                for _, row in gt_df.iterrows():
-                    if pd.isna(row[match_col]):
-                        continue
-                    s1_id = row["source1_entity_id"]
-                    matches = {m.strip() for m in str(row[match_col]).split(",") if m.strip() and m.strip() != "nan"}
-                    if matches:
-                        gt_map[s1_id] = matches
-                        total_gt_pairs += len(matches)
-                del gt_df
-                gc.collect()
-                print(f"  Loaded {len(gt_map):,} true S1 matches ({total_gt_pairs:,} total true pairs) in {time.time() - t0:.2f}s.")
-            else:
-                print(f"\n[Step 4/5] Skipping in-flight ground truth sets in RAM (~2 GB saved). Exact recall is audited post-hoc.")
+            print(f"\n[Step 4/5] Loading ground truth pairs for real-time recall ceiling tracking...")
+            t0 = time.time()
+            gt_df = pd.read_csv(ground_truth_path, sep="\t")
+            match_col = "matched_entity_ids" if "matched_entity_ids" in gt_df.columns else "matched_entity_id"
+            for _, row in gt_df.iterrows():
+                if pd.isna(row[match_col]):
+                    continue
+                s1_id = row["source1_entity_id"]
+                matches = {m.strip() for m in str(row[match_col]).split(",") if m.strip() and m.strip() != "nan"}
+                if matches:
+                    gt_map[s1_id] = matches
+                    total_gt_pairs += len(matches)
+            del gt_df
+            gc.collect()
+            print(f"  Loaded {len(gt_map):,} true S1 matches ({total_gt_pairs:,} total true pairs) in {time.time() - t0:.2f}s.")
 
         # Prepare streaming output writers
         os.makedirs(os.path.dirname(os.path.abspath(output_parquet)), exist_ok=True)
@@ -758,6 +561,7 @@ class CandidateBlocker:
         total_candidate_pairs = 0
         total_zero_candidates = 0
         running_true_retrieved = 0
+        cand_counts_all = []
 
         country_stats = defaultdict(lambda: {"total": 0, "pairs": 0, "zeros": 0})
 
@@ -772,37 +576,57 @@ class CandidateBlocker:
             # Query exact indexes
             exact_candidates = self.retrieve_exact_candidates(s1_prep, indexes)
 
-            # Query fuzzy matrices (chunk_size=50 prevents memory spikes)
-            fuzzy_candidates = self.retrieve_fuzzy_candidates_for_batch(s1_prep, country_models, chunk_size=50)
+            # Query fuzzy matrices
+            fuzzy_candidates = self.retrieve_fuzzy_candidates_for_batch(s1_prep, country_models)
 
-            # Direct columnar PyArrow assembly
-            table, n_pairs, batch_zeros, cand_grouped, batch_ctry_stats = self.assemble_candidate_table(
-                s1_prep, exact_candidates, fuzzy_candidates
-            )
+            # Assemble candidate rows
+            rows = self.assemble_candidate_rows(s1_prep, exact_candidates, fuzzy_candidates)
+            df_batch = pd.DataFrame(rows)
+
+            # Type casting
+            df_batch["exact_ch1_core_name"] = df_batch["exact_ch1_core_name"].astype("int8")
+            df_batch["exact_ch2_sorted_tokens"] = df_batch["exact_ch2_sorted_tokens"].astype("int8")
+            df_batch["exact_ch3_state_prefix"] = df_batch["exact_ch3_state_prefix"].astype("int8")
+            df_batch["exact_ch4_state_phonetic"] = df_batch["exact_ch4_state_phonetic"].astype("int8")
+            df_batch["exact_ch5_acronym"] = df_batch["exact_ch5_acronym"].astype("int8")
+            df_batch["exact_ch6_address_tokens"] = df_batch["exact_ch6_address_tokens"].astype("int8")
+            df_batch["tfidf_cosine_score"] = df_batch["tfidf_cosine_score"].astype("float32")
+
+            n_pairs = len(df_batch[df_batch["candidate_entity_id"].notna()])
             total_candidate_pairs += n_pairs
-            total_zero_candidates += batch_zeros
 
             # Stream directly to Parquet file
+            table = pa.Table.from_pandas(df_batch, schema=CANDIDATE_PA_SCHEMA, preserve_index=False)
             parquet_writer.write_table(table)
 
-            # Stream TSV if requested (fast row-by-row write using cand_grouped)
+            # Stream TSV if requested
             if tsv_f is not None:
+                # Group candidates for this batch
+                valid_b = df_batch[df_batch["candidate_entity_id"].notna()]
+                cand_grouped = valid_b.groupby("source1_entity_id")["candidate_entity_id"].apply(lambda x: ",".join(x)).to_dict()
                 for s1_id in s1_chunk["entity_id"]:
-                    cand_list = cand_grouped.get(s1_id, [])
-                    cand_str = ",".join(cand_list)
+                    cand_str = cand_grouped.get(s1_id, "")
                     tsv_f.write(f"{s1_id}\t{cand_str}\n")
 
-            # Track ground truth recall if in-flight tracking enabled
+            # Track ground truth recall if available
             if gt_map:
-                for s1_id, cands in cand_grouped.items():
-                    if s1_id in gt_map:
-                        running_true_retrieved += len(gt_map[s1_id].intersection(cands))
+                valid_b = df_batch[df_batch["candidate_entity_id"].notna()]
+                b_cands_by_s1 = valid_b.groupby("source1_entity_id")["candidate_entity_id"].apply(set).to_dict()
+                for s1_id, true_set in gt_map.items():
+                    if s1_id in b_cands_by_s1:
+                        running_true_retrieved += len(true_set.intersection(b_cands_by_s1[s1_id]))
+
+            # Batch stats
+            batch_zeros = len(df_batch[df_batch["candidate_entity_id"].isna()])
+            total_zero_candidates += batch_zeros
 
             # Country stats update
             for ctry, grp in s1_prep.groupby("country"):
                 country_stats[ctry]["total"] += len(grp)
-                country_stats[ctry]["pairs"] += batch_ctry_stats[ctry][0]
-                country_stats[ctry]["zeros"] += batch_ctry_stats[ctry][1]
+                b_valid_ctry = df_batch[(df_batch["country"] == ctry) & (df_batch["candidate_entity_id"].notna())]
+                country_stats[ctry]["pairs"] += len(b_valid_ctry)
+                b_zero_ctry = df_batch[(df_batch["country"] == ctry) & (df_batch["candidate_entity_id"].isna())]
+                country_stats[ctry]["zeros"] += len(b_zero_ctry)
 
             recall_str = ""
             if total_gt_pairs > 0:
@@ -811,7 +635,7 @@ class CandidateBlocker:
 
             print(f"  Batch {batch_idx:03d}: {n_batch:,} S1 | Pairs: {n_pairs:,} (avg {n_pairs/n_batch:.1f}/S1) | 0-cands: {batch_zeros} | Elapsed: {time.time() - t_batch:.1f}s{recall_str}")
 
-            del s1_prep, exact_candidates, fuzzy_candidates, table, cand_grouped, batch_ctry_stats
+            del s1_prep, exact_candidates, fuzzy_candidates, rows, df_batch, table
             gc.collect()
 
         # Close streams

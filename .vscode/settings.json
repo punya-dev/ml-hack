@@ -1,0 +1,10 @@
+{
+  "python.analysis.extraPaths": [
+    "./code/business_entity_resolution",
+    "./src"
+  ],
+  "python.autoComplete.extraPaths": [
+    "./code/business_entity_resolution",
+    "./src"
+  ]
+}

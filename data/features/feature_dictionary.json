@@ -1,0 +1,200 @@
+[
+  {
+    "name": "token_sort_ratio",
+    "description": "RapidFuzz token_sort_ratio on clean_name (S1 vs candidate). Word-order invariant.",
+    "dtype": "float32",
+    "group": "name"
+  },
+  {
+    "name": "token_set_ratio",
+    "description": "RapidFuzz token_set_ratio on clean_name. Robust to subset/superset names.",
+    "dtype": "float32",
+    "group": "name"
+  },
+  {
+    "name": "partial_ratio",
+    "description": "RapidFuzz partial_ratio on clean_name. Best substring alignment.",
+    "dtype": "float32",
+    "group": "name"
+  },
+  {
+    "name": "jaro_winkler",
+    "description": "Jaro-Winkler similarity on clean_name. Good for transpositions/OCR typos.",
+    "dtype": "float32",
+    "group": "name"
+  },
+  {
+    "name": "char_3gram_jaccard",
+    "description": "Character 3-gram Jaccard similarity on clean_name. Robust to transliteration variants.",
+    "dtype": "float32",
+    "group": "name"
+  },
+  {
+    "name": "len_ratio",
+    "description": "min_len / max_len of clean_name token lengths. Near 1.0 for near-identical names.",
+    "dtype": "float32",
+    "group": "name"
+  },
+  {
+    "name": "best_alt_name_score",
+    "description": "Max token_sort_ratio across all DBA/alt_names of S1 vs candidate clean_name. Catches DBA-vs-legal-name pairs.",
+    "dtype": "float32",
+    "group": "name"
+  },
+  {
+    "name": "core_name_exact",
+    "description": "1 if core_name (legal-suffix-stripped) strings are identical after normalisation.",
+    "dtype": "int8",
+    "group": "name"
+  },
+  {
+    "name": "street_number_exact",
+    "description": "1 if leading street number tokens match exactly (both present).",
+    "dtype": "int8",
+    "group": "address"
+  },
+  {
+    "name": "street_name_fuzzy",
+    "description": "token_sort_ratio on street field. 0.0 if either side missing.",
+    "dtype": "float32",
+    "group": "address"
+  },
+  {
+    "name": "city_fuzzy",
+    "description": "token_sort_ratio on city field. 0.0 if either side missing.",
+    "dtype": "float32",
+    "group": "address"
+  },
+  {
+    "name": "state_equal",
+    "description": "1 if normalised state strings are identical (both present).",
+    "dtype": "int8",
+    "group": "address"
+  },
+  {
+    "name": "postal_exact",
+    "description": "1 if postal codes are identical (both present and non-empty).",
+    "dtype": "int8",
+    "group": "address"
+  },
+  {
+    "name": "both_postal_present",
+    "description": "1 if both S1 and candidate have a non-empty postal code. Context flag for postal_exact.",
+    "dtype": "int8",
+    "group": "address"
+  },
+  {
+    "name": "landmark_jaccard",
+    "description": "Token-set Jaccard on landmark_text. 0.0 if either side empty.",
+    "dtype": "float32",
+    "group": "address"
+  },
+  {
+    "name": "sorted_address_tokens_exact",
+    "description": "1 if sorted_address_tokens strings are identical.",
+    "dtype": "int8",
+    "group": "address"
+  },
+  {
+    "name": "exact_ch1_core_name",
+    "description": "1 if pair was retrieved via exact core_name inverted index channel.",
+    "dtype": "int8",
+    "group": "channel"
+  },
+  {
+    "name": "exact_ch2_sorted_tokens",
+    "description": "1 if pair was retrieved via sorted_tokens inverted index channel.",
+    "dtype": "int8",
+    "group": "channel"
+  },
+  {
+    "name": "exact_ch3_state_prefix",
+    "description": "1 if pair was retrieved via (country, state, prefix_key) channel.",
+    "dtype": "int8",
+    "group": "channel"
+  },
+  {
+    "name": "exact_ch4_state_phonetic",
+    "description": "1 if pair was retrieved via (country, state, phonetic_key) channel.",
+    "dtype": "int8",
+    "group": "channel"
+  },
+  {
+    "name": "exact_ch5_acronym",
+    "description": "1 if pair was retrieved via acronym_key channel.",
+    "dtype": "int8",
+    "group": "channel"
+  },
+  {
+    "name": "exact_ch6_address_tokens",
+    "description": "1 if pair was retrieved via sorted_address_tokens channel.",
+    "dtype": "int8",
+    "group": "channel"
+  },
+  {
+    "name": "tfidf_cosine_score",
+    "description": "TF-IDF char-ngram cosine similarity from Phase-1 fuzzy channel. 0.0 for exact-only pairs.",
+    "dtype": "float32",
+    "group": "channel"
+  },
+  {
+    "name": "channel_hit_count",
+    "description": "Sum of the 6 exact channel flags (0-6). Pairs hit 3+ ways are near-certain matches.",
+    "dtype": "int8",
+    "group": "channel"
+  },
+  {
+    "name": "s1_missing_street",
+    "description": "1 if S1 street field is empty/null after parsing.",
+    "dtype": "int8",
+    "group": "missingness"
+  },
+  {
+    "name": "s1_missing_city",
+    "description": "1 if S1 city field is empty/null after parsing.",
+    "dtype": "int8",
+    "group": "missingness"
+  },
+  {
+    "name": "s1_missing_state",
+    "description": "1 if S1 state field is empty/null after parsing.",
+    "dtype": "int8",
+    "group": "missingness"
+  },
+  {
+    "name": "s1_missing_postal",
+    "description": "1 if S1 postal_code is empty/null. Expected ~93-100% for Indian records.",
+    "dtype": "int8",
+    "group": "missingness"
+  },
+  {
+    "name": "cand_missing_street",
+    "description": "1 if candidate street field is empty/null after parsing.",
+    "dtype": "int8",
+    "group": "missingness"
+  },
+  {
+    "name": "cand_missing_city",
+    "description": "1 if candidate city field is empty/null after parsing.",
+    "dtype": "int8",
+    "group": "missingness"
+  },
+  {
+    "name": "cand_missing_state",
+    "description": "1 if candidate state field is empty/null after parsing.",
+    "dtype": "int8",
+    "group": "missingness"
+  },
+  {
+    "name": "cand_missing_postal",
+    "description": "1 if candidate postal_code is empty/null.",
+    "dtype": "int8",
+    "group": "missingness"
+  },
+  {
+    "name": "country_match",
+    "description": "1 if S1 country == candidate country. Should always be 1 (country-partitioned blocking). A 0 signals a blocker bug.",
+    "dtype": "int8",
+    "group": "meta"
+  }
+]

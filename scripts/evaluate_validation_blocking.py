@@ -13,7 +13,11 @@ import time
 import pandas as pd
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT_DIR)
+CODE_DIR = os.path.join(ROOT_DIR, "code", "business_entity_resolution")
+if os.path.isdir(CODE_DIR):
+    sys.path.insert(0, CODE_DIR)
 
 from src.blocker import CandidateBlocker
 from src.country_normalizer import normalize_country

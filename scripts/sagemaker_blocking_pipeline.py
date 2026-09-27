@@ -63,12 +63,14 @@ def upload_code(session):
     upload_file_if_needed(s3, worker_script, BUCKET, "blocking_job/code/run_worker.py")
 
     # 2. Upload src/ directory
-    for src_file in glob.glob("src/*.py"):
+    src_files = glob.glob("code/business_entity_resolution/src/*.py") or glob.glob("src/*.py")
+    for src_file in src_files:
         fname = os.path.basename(src_file)
         upload_file_if_needed(s3, src_file, BUCKET, f"blocking_job/code/src/{fname}")
 
     # 3. Upload configs/ directory
-    for cfg_file in glob.glob("configs/*.json"):
+    cfg_files = glob.glob("code/business_entity_resolution/configs/*.json") or glob.glob("configs/*.json")
+    for cfg_file in cfg_files:
         fname = os.path.basename(cfg_file)
         upload_file_if_needed(s3, cfg_file, BUCKET, f"blocking_job/code/configs/{fname}")
 

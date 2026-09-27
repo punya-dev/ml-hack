@@ -1,0 +1,50 @@
+========================================================================
+  PHASE 3 FEATURE AUDIT  |  split = VAL
+========================================================================
+  Rows    : 3,258,716
+  Features: 33
+  Pos/Neg : 171,357 / 3,087,359
+
+  Feature                            dtype      mean       std       min       max   null%
+  ------------------------------------------------------------------------
+  token_sort_ratio                 float32    0.5393    0.1882    0.0000    1.0000   0.00%
+  token_set_ratio                  float32    0.6170    0.2224    0.0000    1.0000   0.00%
+  partial_ratio                    float32    0.6659    0.1795    0.0000    1.0000   0.00%
+  jaro_winkler                     float32    0.7015    0.1364    0.0000    1.0000   0.00%
+  char_3gram_jaccard               float32    0.2611    0.2265    0.0000    1.0000   0.00%
+  len_ratio                        float32    0.7151    0.2115    0.0000    1.0000   0.00%
+  best_alt_name_score              float32    0.0001    0.0040    0.0000    1.0000   0.00%
+  core_name_exact                     int8    0.0405    0.1970    0.0000    1.0000   0.00%
+  street_number_exact                 int8    0.0198    0.1393    0.0000    1.0000   0.00%
+  street_name_fuzzy                float32    0.3283    0.2320    0.0000    1.0000   0.00%
+  city_fuzzy                       float32    0.4200    0.3814    0.0000    1.0000   0.00%
+  state_equal                         int8    0.5813    0.4933    0.0000    1.0000   0.00%
+  postal_exact                        int8    0.0016    0.0405    0.0000    1.0000   0.00%
+  both_postal_present                 int8    0.0064    0.0798    0.0000    1.0000   0.00%
+  landmark_jaccard                 float32    0.9284    0.2572    0.0000    1.0000   0.00%
+  sorted_address_tokens_exact         int8    0.0100    0.0995    0.0000    1.0000   0.00%
+  exact_ch1_core_name                 int8    0.0419    0.2003    0.0000    1.0000   0.00%
+  exact_ch2_sorted_tokens             int8    0.0419    0.2004    0.0000    1.0000   0.00%
+  exact_ch3_state_prefix              int8    0.3337    0.4715    0.0000    1.0000   0.00%
+  exact_ch4_state_phonetic            int8    0.0823    0.2748    0.0000    1.0000   0.00%
+  exact_ch5_acronym                   int8    0.0872    0.2822    0.0000    1.0000   0.00%
+  exact_ch6_address_tokens            int8    0.0100    0.0995    0.0000    1.0000   0.00%
+  tfidf_cosine_score               float32    0.2392    0.2153    0.0000    1.0000   0.00%
+  channel_hit_count                   int8    0.5969    0.9112    0.0000    6.0000   0.00%
+  s1_missing_street                   int8    0.0002    0.0138    0.0000    1.0000   0.00%
+  s1_missing_city                     int8    0.0005    0.0231    0.0000    1.0000   0.00%
+  s1_missing_state                    int8    0.0002    0.0126    0.0000    1.0000   0.00%
+  s1_missing_postal                   int8    0.9612    0.1931    0.0000    1.0000   0.00%
+  cand_missing_street                 int8    0.1630    0.3694    0.0000    1.0000   0.00%
+  cand_missing_city                   int8    0.1630    0.3694    0.0000    1.0000   0.00%
+  cand_missing_state                  int8    0.1625    0.3689    0.0000    1.0000   0.00%
+  cand_missing_postal                 int8    0.9662    0.1808    0.0000    1.0000   0.00%
+  country_match                       int8    1.0000    0.0000    1.0000    1.0000   0.00%
+
+[Country split — mean token_sort_ratio by label]
+  country=India     label=0  token_sort_ratio mean=0.5326  n=1,356,188
+  country=India     label=1  token_sort_ratio mean=0.8229  n=67,961
+  country=US        label=0  token_sort_ratio mean=0.5174  n=1,731,171
+  country=US        label=1  token_sort_ratio mean=0.8078  n=103,396
+
+========================================================================

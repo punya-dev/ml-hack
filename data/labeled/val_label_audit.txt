@@ -1,0 +1,37 @@
+========================================================================
+  PHASE 2 LABEL AUDIT  |  split = VAL
+========================================================================
+
+[Candidate Pool]
+  Total candidate pairs        :    3,258,716
+  Positive (label=1) pairs     :      171,357  (5.2584%)
+  Negative (label=0) pairs     :    3,087,359  (94.7416%)
+  Neg : Pos ratio              :       18.02 : 1
+
+[Recall Ceiling Check]
+  Total GT match pairs         :      172,839
+  GT pairs found in candidates :      171,357  (99.1426%)
+  GT pairs missed by blocker   :        1,482
+
+[Singletons]
+  True singleton S1 entities   :        2,792
+  Blocker correctly returned 0 :            0
+  Blocker returned >=1 cand.   :        2,792
+
+[Per-Channel Positive Contribution]
+  Channel                         Pos via ch   % of all pos   Total via ch
+  ------------------------------------------------------------------------
+  Ch1  core_name                      88,178         51.46%        136,514
+  Ch2  sorted_tokens                  88,820         51.83%        136,543
+  Ch3  state+prefix                  135,119         78.85%      1,087,348
+  Ch4  state+phonetic                113,034         65.96%        268,072
+  Ch5  acronym                        43,604         25.45%        284,220
+  Ch6  address_tokens                 32,342         18.87%         32,584
+  Ch7  tfidf_only (no exact hit)      18,775         10.96%      1,836,345
+
+[Country Breakdown]
+  Country            Total         Pos      Pos%    Neg:Pos
+  India          1,424,149      67,961   4.7720%     19.96:1
+  US             1,834,567     103,396   5.6360%     16.74:1
+
+========================================================================

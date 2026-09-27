@@ -5,9 +5,9 @@ s3_path         : /Users/punyapratap/Downloads/ML_hackathon/dataset/val/val_sour
 gt_path         : /Users/punyapratap/Downloads/ML_hackathon/dataset/val/val_ground_truth.tsv
 out_parquet     : /Users/punyapratap/Downloads/ML_hackathon/output/val_candidates.parquet
 out_tsv         : /Users/punyapratap/Downloads/ML_hackathon/output/val_candidate_pairs.tsv
-chunk_size      : 50000
+chunk_size      : 100000
 threshold       : 0.24
 max_fuzzy       : 50
 max_total       : 80
-elapsed_seconds : 143.79
-elapsed_minutes : 2.40
+elapsed_seconds : 36.65
+elapsed_minutes : 0.61

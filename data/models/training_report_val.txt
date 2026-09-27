@@ -1,0 +1,57 @@
+======================================================================
+  PHASE 4+5 TRAINING REPORT  |  split = VAL
+======================================================================
+  Total rows         : 3,258,716
+  Positives          : 171,357  (5.2584%)
+  Negatives          : 3,087,359
+  scale_pos_weight   : 18.02
+  Features used      : 32
+  Best LGB iteration : 1915
+
+[Decision Policy Sweep — macro-F₀.₅]
+  Best threshold   : 0.9249999999999999
+  Best macro-F₀.₅   : 0.990473
+  Entities evaluated : 50,000
+
+[Country Breakdown at threshold=0.925]
+  India     : macro-F0.5 = 0.987060 (n=20,011)
+  US        : macro-F0.5 = 0.992750 (n=29,989)
+
+
+[Feature Importances — split gain]
+  Feature                             Importance  % of total
+  ----------------------------------------------------------
+  tfidf_cosine_score                       31491       13.05%
+  len_ratio                                29105       12.06%
+  jaro_winkler                             28183       11.68%
+  partial_ratio                            25879       10.73%
+  char_3gram_jaccard                       25785       10.69%
+  street_name_fuzzy                        24703       10.24%
+  token_sort_ratio                         24665       10.22%
+  token_set_ratio                          21097        8.74%
+  city_fuzzy                               13955        5.78%
+  channel_hit_count                         5441        2.25%
+  state_equal                               1526        0.63%
+  landmark_jaccard                          1340        0.56%
+  exact_ch4_state_phonetic                  1295        0.54%
+  exact_ch3_state_prefix                    1276        0.53%
+  street_number_exact                       1004        0.42%
+  s1_missing_postal                          757        0.31%
+  exact_ch5_acronym                          652        0.27%
+  cand_missing_street                        493        0.20%
+  cand_missing_city                          365        0.15%
+  postal_exact                               312        0.13%
+  core_name_exact                            294        0.12%
+  cand_missing_postal                        291        0.12%
+  cand_missing_state                         288        0.12%
+  sorted_address_tokens_exact                285        0.12%
+  exact_ch1_core_name                        234        0.10%
+  exact_ch2_sorted_tokens                    206        0.09%
+  both_postal_present                        168        0.07%
+  s1_missing_state                            58        0.02%
+  exact_ch6_address_tokens                    49        0.02%
+  s1_missing_city                             44        0.02%
+  best_alt_name_score                         36        0.01%
+  s1_missing_street                           13        0.01%
+
+======================================================================

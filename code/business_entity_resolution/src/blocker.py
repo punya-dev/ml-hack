@@ -25,15 +25,22 @@ import pandas as pd
 import numpy as np
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
+from joblib import Parallel, delayed
+from tqdm.auto import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 # Ensure parent directory is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.name_normalizer import normalize_business_name
-from src.address_parser import normalize_business_address
-from src.country_normalizer import normalize_country
+try:
+    from name_normalizer import normalize_business_name
+    from address_parser import normalize_business_address
+    from country_normalizer import normalize_country
+except ImportError:
+    from src.name_normalizer import normalize_business_name
+    from src.address_parser import normalize_business_address
+    from src.country_normalizer import normalize_country
 
 
 CANDIDATE_PA_SCHEMA = pa.schema([
@@ -51,6 +58,116 @@ CANDIDATE_PA_SCHEMA = pa.schema([
 ])
 
 
+def _process_fuzzy_subchunk(
+    batch_s1: sp.csr_matrix,
+    sub_s1_ids: List[str],
+    X_other_T: sp.spmatrix,
+    other_ids: np.ndarray,
+    fuzzy_threshold: float,
+    max_fuzzy: int,
+) -> List[Tuple[str, List[Tuple[str, float]]]]:
+    """
+    Worker function for parallel candidate dot-product scoring on a sub-chunk of S1 queries.
+    Uses pre-transposed X_other_T with shared memory across worker threads.
+    """
+    sim_chunk = batch_s1.dot(X_other_T)
+    # Filter below threshold in-place
+    sim_chunk.data[sim_chunk.data < fuzzy_threshold] = 0
+    sim_chunk.eliminate_zeros()
+
+    sub_results = []
+    for local_i, s1_id in enumerate(sub_s1_ids):
+        row_start = sim_chunk.indptr[local_i]
+        row_end = sim_chunk.indptr[local_i + 1]
+        if row_start == row_end:
+            continue
+
+        col_indices = sim_chunk.indices[row_start:row_end]
+        scores = sim_chunk.data[row_start:row_end]
+
+        if len(col_indices) > max_fuzzy:
+            top_k_idx = np.argpartition(scores, -max_fuzzy)[-max_fuzzy:]
+            sorted_order = np.argsort(-scores[top_k_idx])
+            selected_cols = col_indices[top_k_idx[sorted_order]]
+            selected_scores = scores[top_k_idx[sorted_order]]
+        else:
+            sorted_order = np.argsort(-scores)
+            selected_cols = col_indices[sorted_order]
+            selected_scores = scores[sorted_order]
+
+        cands = [
+            (other_ids[c_idx], float(sc))
+            for c_idx, sc in zip(selected_cols, selected_scores)
+        ]
+        sub_results.append((s1_id, cands))
+
+    return sub_results
+
+
+def _preprocess_records_slice(records: List[Tuple]) -> Dict[str, list]:
+    """
+    Worker function for parallel preprocessing of entity records.
+    Normalizes country, business name, and address fields across worker processes.
+    """
+    eids = []
+    norm_names = []
+    core_names = []
+    sorted_name_tokens = []
+    prefix_keys = []
+    phonetic_keys = []
+    acronym_keys = []
+    alt_names_list = []
+
+    norm_addrs = []
+    states = []
+    cities = []
+    sorted_addr_tokens = []
+    countries = []
+    search_texts = []
+
+    for eid, raw_c, raw_name, raw_addr in records:
+        eids.append(eid)
+        c = normalize_country(str(raw_c)) if raw_c and str(raw_c).strip() != "" else ""
+        countries.append(c)
+
+        pn = normalize_business_name(str(raw_name) if raw_name and str(raw_name).strip() != "" else "")
+        clean_name = pn["clean_name"]
+        norm_names.append(clean_name)
+        core_names.append(pn["core_name"])
+        sorted_name_tokens.append(pn["sorted_tokens"])
+        prefix_keys.append(pn["prefix_key"])
+        phonetic_keys.append(pn["phonetic_key"])
+        acronym_keys.append(pn["acronym_key"])
+        alt_names_list.append(pn["alt_names"])
+
+        pa_dict = normalize_business_address(str(raw_addr) if raw_addr and str(raw_addr).strip() != "" else "", country=c)
+        clean_addr = pa_dict["clean_address"]
+        norm_addrs.append(clean_addr)
+        states.append(pa_dict["state"])
+        cities.append(pa_dict["city"])
+        sorted_addr_tokens.append(pa_dict["sorted_address_tokens"])
+
+        combined = f"{clean_name} {clean_addr}".strip()
+        search_texts.append(combined)
+
+    return {
+        "entity_id": eids,
+        "country": countries,
+        "clean_name": norm_names,
+        "core_name": core_names,
+        "sorted_tokens": sorted_name_tokens,
+        "prefix_key": prefix_keys,
+        "phonetic_key": phonetic_keys,
+        "acronym_key": acronym_keys,
+        "alt_names": alt_names_list,
+        "clean_address": norm_addrs,
+        "state": states,
+        "city": cities,
+        "sorted_address_tokens": sorted_addr_tokens,
+        "search_text": search_texts,
+    }
+
+
 class CandidateBlocker:
     """
     Multi-channel candidate blocker combining:
@@ -66,82 +183,58 @@ class CandidateBlocker:
         max_fuzzy_candidates_per_s1: int = 50,
         max_total_candidates_per_s1: int = 80,
         ngram_range: Tuple[int, int] = (3, 3),
+        n_jobs: Optional[int] = None,
+        subchunk_size: int = 500,
     ):
         self.fuzzy_threshold = fuzzy_threshold
         self.max_fuzzy_candidates_per_s1 = max_fuzzy_candidates_per_s1
         self.max_total_candidates_per_s1 = max_total_candidates_per_s1
         self.ngram_range = ngram_range
+        self.n_jobs = n_jobs if n_jobs is not None else (os.cpu_count() or 4)
+        self.subchunk_size = subchunk_size
 
-    def preprocess_df(self, df: pd.DataFrame) -> pd.DataFrame:
+    def preprocess_df(self, df: pd.DataFrame, n_jobs: Optional[int] = None) -> pd.DataFrame:
         """
         Normalize name, address, and country fields for all records in df.
-        Uses itertuples for high-speed namedtuple streaming without dictionary allocation.
+        Uses multi-processing across CPU cores when len(df) >= 5,000 for maximum throughput.
         """
-        eids = []
-        norm_names = []
-        core_names = []
-        sorted_name_tokens = []
-        prefix_keys = []
-        phonetic_keys = []
-        acronym_keys = []
-        alt_names_list = []
+        n_workers = n_jobs if n_jobs is not None else self.n_jobs
+        n_rows = len(df)
+        if n_rows == 0:
+            return pd.DataFrame({
+                "entity_id": [], "country": [], "clean_name": [], "core_name": [],
+                "sorted_tokens": [], "prefix_key": [], "phonetic_key": [], "acronym_key": [],
+                "alt_names": [], "clean_address": [], "state": [], "city": [],
+                "sorted_address_tokens": [], "search_text": []
+            })
 
-        norm_addrs = []
-        states = []
-        cities = []
-        sorted_addr_tokens = []
-        countries = []
-        search_texts = []
+        records = list(zip(
+            df["entity_id"].fillna("").astype(str) if "entity_id" in df.columns else [""] * n_rows,
+            df["country"].fillna("").astype(str) if "country" in df.columns else [""] * n_rows,
+            df["business_name"].fillna("").astype(str) if "business_name" in df.columns else [""] * n_rows,
+            df["business_address"].fillna("").astype(str) if "business_address" in df.columns else [""] * n_rows,
+        ))
 
-        for r in df.itertuples(index=False):
-            eid = getattr(r, "entity_id", "")
-            eids.append(eid)
+        # For small slices (< 5,000) or single core, run sequentially without IPC overhead
+        if n_rows < 5000 or n_workers <= 1:
+            res_dict = _preprocess_records_slice(records)
+            return pd.DataFrame(res_dict)
 
-            raw_c = getattr(r, "country", None)
-            c = normalize_country(str(raw_c)) if pd.notna(raw_c) and raw_c != "" else ""
-            countries.append(c)
+        # Multi-process execution partitioned across worker processes
+        effective_workers = min(n_workers, max(1, n_rows // 2000))
+        chunk_size = (n_rows + effective_workers - 1) // effective_workers
+        slices = [records[i:i + chunk_size] for i in range(0, n_rows, chunk_size)]
 
-            raw_name = getattr(r, "business_name", None)
-            raw_name_str = "" if pd.isna(raw_name) else str(raw_name)
-            pn = normalize_business_name(raw_name_str)
-            clean_name = pn["clean_name"]
-            norm_names.append(clean_name)
-            core_names.append(pn["core_name"])
-            sorted_name_tokens.append(pn["sorted_tokens"])
-            prefix_keys.append(pn["prefix_key"])
-            phonetic_keys.append(pn["phonetic_key"])
-            acronym_keys.append(pn["acronym_key"])
-            alt_names_list.append(pn["alt_names"])
+        results = Parallel(n_jobs=effective_workers, backend="loky")(
+            delayed(_preprocess_records_slice)(s) for s in slices
+        )
 
-            raw_addr = getattr(r, "business_address", None)
-            raw_addr_str = "" if pd.isna(raw_addr) else str(raw_addr)
-            pa_dict = normalize_business_address(raw_addr_str, country=c)
-            clean_addr = pa_dict["clean_address"]
-            norm_addrs.append(clean_addr)
-            states.append(pa_dict["state"])
-            cities.append(pa_dict["city"])
-            sorted_addr_tokens.append(pa_dict["sorted_address_tokens"])
+        combined = {col: [] for col in results[0]}
+        for r in results:
+            for col in combined:
+                combined[col].extend(r[col])
 
-            combined = f"{clean_name} {clean_addr}".strip()
-            search_texts.append(combined)
-
-        res = pd.DataFrame({
-            "entity_id": eids,
-            "country": countries,
-            "clean_name": norm_names,
-            "core_name": core_names,
-            "sorted_tokens": sorted_name_tokens,
-            "prefix_key": prefix_keys,
-            "phonetic_key": phonetic_keys,
-            "acronym_key": acronym_keys,
-            "alt_names": alt_names_list,
-            "clean_address": norm_addrs,
-            "state": states,
-            "city": cities,
-            "sorted_address_tokens": sorted_addr_tokens,
-            "search_text": search_texts,
-        })
-        return res
+        return pd.DataFrame(combined)
 
     def index_candidate_chunk(self, other_prep: pd.DataFrame, indexes: Dict[str, dict]):
         """
@@ -286,58 +379,91 @@ class CandidateBlocker:
     def retrieve_fuzzy_candidates_for_batch(
         self,
         s1_batch_df: pd.DataFrame,
-        country_models: Dict[str, Tuple[TfidfVectorizer, sp.csr_matrix, np.ndarray]],
-        chunk_size: int = 1000,
+        country_models: Dict[str, Tuple[TfidfVectorizer, sp.spmatrix, np.ndarray]],
+        subchunk_size: Optional[int] = None,
+        n_jobs: Optional[int] = None,
+        batch_idx: Optional[int] = None,
+        total_batches: Optional[int] = None,
     ) -> Dict[str, List[Tuple[str, float]]]:
         """
-        Query country-partitioned TF-IDF matrices for a batch of S1 records.
+        Query country-partitioned TF-IDF matrices for a batch of S1 records in parallel across CPU cores.
+        Streams subchunk results and prints real-time intra-batch progress at regular intervals.
         Returns dict: s1_id -> list of (cand_eid, cosine_score)
         """
+        eff_subchunk = subchunk_size if subchunk_size is not None else self.subchunk_size
+        eff_jobs = n_jobs if n_jobs is not None else self.n_jobs
         fuzzy_candidates = defaultdict(list)
+
+        n_batch = len(s1_batch_df)
+        batch_tag = f"Batch {batch_idx:03d}/{total_batches:03d}" if (batch_idx is not None and total_batches is not None) else (f"Batch {batch_idx:03d}" if batch_idx is not None else "Batch")
+
+        # Report progress every ~10% of batch or every 2,500 entities (whichever is smaller)
+        report_interval = max(1000, min(5000, n_batch // 10))
+        completed_in_batch = 0
+        last_reported = 0
+        t_fuzzy_start = time.time()
 
         for ctry, grp in s1_batch_df.groupby("country"):
             if ctry not in country_models:
                 continue
-            vectorizer, X_other, other_ids = country_models[ctry]
+            vectorizer, X_other_T, other_ids = country_models[ctry]
             s1_ids = grp["entity_id"].tolist()
             s1_texts = grp["search_text"].tolist()
 
             X_s1 = vectorizer.transform(s1_texts)
             n_s1 = len(s1_ids)
 
-            for start_idx in range(0, n_s1, chunk_size):
-                end_idx = min(start_idx + chunk_size, n_s1)
-                batch_s1 = X_s1[start_idx:end_idx]
-                sim_chunk = batch_s1.dot(X_other.T)
+            subchunks = []
+            for start_idx in range(0, n_s1, eff_subchunk):
+                end_idx = min(start_idx + eff_subchunk, n_s1)
+                subchunks.append((
+                    X_s1[start_idx:end_idx],
+                    s1_ids[start_idx:end_idx]
+                ))
 
-                # Filter below threshold in-place
-                sim_chunk.data[sim_chunk.data < self.fuzzy_threshold] = 0
-                sim_chunk.eliminate_zeros()
+            total_subchunks_ctry = len(subchunks)
+            subchunk_i = 0
+            t_ctry = time.time()
 
-                for local_i in range(end_idx - start_idx):
-                    global_i = start_idx + local_i
-                    s1_id = s1_ids[global_i]
+            # Run parallel sub-chunks with multithreading & stream results via generator
+            parallel_gen = Parallel(n_jobs=eff_jobs, prefer="threads", return_as="generator")(
+                delayed(_process_fuzzy_subchunk)(
+                    batch_s1,
+                    sub_s1_ids,
+                    X_other_T,
+                    other_ids,
+                    self.fuzzy_threshold,
+                    self.max_fuzzy_candidates_per_s1,
+                )
+                for batch_s1, sub_s1_ids in subchunks
+            )
 
-                    row_start = sim_chunk.indptr[local_i]
-                    row_end = sim_chunk.indptr[local_i + 1]
-                    if row_start == row_end:
-                        continue
+            for sub_res in parallel_gen:
+                subchunk_i += 1
+                for s1_id, cands in sub_res:
+                    fuzzy_candidates[s1_id].extend(cands)
+                completed_in_batch += len(sub_res)
 
-                    col_indices = sim_chunk.indices[row_start:row_end]
-                    scores = sim_chunk.data[row_start:row_end]
+                # Report intra-batch progress at regular intervals
+                if (completed_in_batch - last_reported >= report_interval) or (completed_in_batch == n_batch):
+                    last_reported = completed_in_batch
+                    pct = (completed_in_batch / n_batch) * 100
+                    elapsed = time.time() - t_fuzzy_start
+                    rate = completed_in_batch / elapsed if elapsed > 0 else 0
+                    est_rem = (n_batch - completed_in_batch) / rate if rate > 0 else 0
+                    print(
+                        f"    [{batch_tag} Progress] Fuzzy matching: {completed_in_batch:,} / {n_batch:,} S1 ({pct:5.1f}%) | "
+                        f"Country: '{ctry}' ({subchunk_i}/{total_subchunks_ctry}) | "
+                        f"Speed: {rate:,.0f} S1/s | Elapsed: {elapsed:5.1f}s | Est remaining: {est_rem:5.1f}s",
+                        flush=True,
+                    )
 
-                    if len(col_indices) > self.max_fuzzy_candidates_per_s1:
-                        top_k_idx = np.argpartition(scores, -self.max_fuzzy_candidates_per_s1)[-self.max_fuzzy_candidates_per_s1:]
-                        sorted_order = np.argsort(-scores[top_k_idx])
-                        selected_cols = col_indices[top_k_idx[sorted_order]]
-                        selected_scores = scores[top_k_idx[sorted_order]]
-                    else:
-                        sorted_order = np.argsort(-scores)
-                        selected_cols = col_indices[sorted_order]
-                        selected_scores = scores[sorted_order]
-
-                    for c_idx, sc in zip(selected_cols, selected_scores):
-                        fuzzy_candidates[s1_id].append((other_ids[c_idx], float(sc)))
+            t_ctry_done = time.time() - t_ctry
+            rate_ctry = n_s1 / t_ctry_done if t_ctry_done > 0 else 0
+            print(
+                f"    [{batch_tag} Progress] Country '{ctry}': {n_s1:,} entities finished in {t_ctry_done:.2f}s ({rate_ctry:,.0f} S1/s)",
+                flush=True,
+            )
 
         return fuzzy_candidates
 
@@ -346,12 +472,26 @@ class CandidateBlocker:
         s1_prep: pd.DataFrame,
         exact_candidates: Dict[str, Dict[str, int]],
         fuzzy_candidates: Dict[str, List[Tuple[str, float]]],
-    ) -> List[dict]:
+    ) -> Tuple[Dict[str, list], Dict[str, List[str]]]:
         """
-        Assemble candidate pair rows with all exact channel indicators and cosine score.
+        Assemble candidate pair columnar dictionary and per-S1 candidate ID mapping.
+        Columnar format allows direct PyArrow Table construction (2-3x faster than dict-of-rows).
         Preserves S1 entities with 0 candidates using candidate_entity_id = None.
         """
-        rows = []
+        cols = {
+            "source1_entity_id": [],
+            "candidate_entity_id": [],
+            "candidate_source": [],
+            "country": [],
+            "exact_ch1_core_name": [],
+            "exact_ch2_sorted_tokens": [],
+            "exact_ch3_state_prefix": [],
+            "exact_ch4_state_phonetic": [],
+            "exact_ch5_acronym": [],
+            "exact_ch6_address_tokens": [],
+            "tfidf_cosine_score": [],
+        }
+        cand_ids_by_s1 = {}
 
         for r in s1_prep.itertuples(index=False):
             s1_id = r.entity_id
@@ -389,39 +529,38 @@ class CandidateBlocker:
                         if len(selected_cands) >= self.max_total_candidates_per_s1:
                             break
 
+            # Record candidate IDs for fast TSV export and recall audit without Pandas groupby
+            cand_ids_by_s1[s1_id] = [c[0] for c in selected_cands]
+
             # 3. Sentinel row if 0 candidates
             if not selected_cands:
-                rows.append({
-                    "source1_entity_id": s1_id,
-                    "candidate_entity_id": None,
-                    "candidate_source": None,
-                    "country": ctry,
-                    "exact_ch1_core_name": 0,
-                    "exact_ch2_sorted_tokens": 0,
-                    "exact_ch3_state_prefix": 0,
-                    "exact_ch4_state_phonetic": 0,
-                    "exact_ch5_acronym": 0,
-                    "exact_ch6_address_tokens": 0,
-                    "tfidf_cosine_score": 0.0,
-                })
+                cols["source1_entity_id"].append(s1_id)
+                cols["candidate_entity_id"].append(None)
+                cols["candidate_source"].append(None)
+                cols["country"].append(ctry)
+                cols["exact_ch1_core_name"].append(0)
+                cols["exact_ch2_sorted_tokens"].append(0)
+                cols["exact_ch3_state_prefix"].append(0)
+                cols["exact_ch4_state_phonetic"].append(0)
+                cols["exact_ch5_acronym"].append(0)
+                cols["exact_ch6_address_tokens"].append(0)
+                cols["tfidf_cosine_score"].append(0.0)
             else:
                 for cand_id, mask, score in selected_cands:
                     cand_src = "S2" if cand_id.startswith("S2") else "S3"
-                    rows.append({
-                        "source1_entity_id": s1_id,
-                        "candidate_entity_id": cand_id,
-                        "candidate_source": cand_src,
-                        "country": ctry,
-                        "exact_ch1_core_name": 1 if (mask & 1) else 0,
-                        "exact_ch2_sorted_tokens": 1 if (mask & 2) else 0,
-                        "exact_ch3_state_prefix": 1 if (mask & 4) else 0,
-                        "exact_ch4_state_phonetic": 1 if (mask & 8) else 0,
-                        "exact_ch5_acronym": 1 if (mask & 16) else 0,
-                        "exact_ch6_address_tokens": 1 if (mask & 32) else 0,
-                        "tfidf_cosine_score": float(score),
-                    })
+                    cols["source1_entity_id"].append(s1_id)
+                    cols["candidate_entity_id"].append(cand_id)
+                    cols["candidate_source"].append(cand_src)
+                    cols["country"].append(ctry)
+                    cols["exact_ch1_core_name"].append(1 if (mask & 1) else 0)
+                    cols["exact_ch2_sorted_tokens"].append(1 if (mask & 2) else 0)
+                    cols["exact_ch3_state_prefix"].append(1 if (mask & 4) else 0)
+                    cols["exact_ch4_state_phonetic"].append(1 if (mask & 8) else 0)
+                    cols["exact_ch5_acronym"].append(1 if (mask & 16) else 0)
+                    cols["exact_ch6_address_tokens"].append(1 if (mask & 32) else 0)
+                    cols["tfidf_cosine_score"].append(float(score))
 
-        return rows
+        return cols, cand_ids_by_s1
 
     def generate_candidate_pairs(
         self, s1_df: pd.DataFrame, other_df: pd.DataFrame, verbose: bool = False
@@ -460,19 +599,16 @@ class CandidateBlocker:
                 dtype=np.float32,
             )
             X_other = vectorizer.fit_transform(texts)
-            country_models[ctry] = (vectorizer, X_other, eids_arr)
+            X_other_T = X_other.T.tocsr()
+            country_models[ctry] = (vectorizer, X_other_T, eids_arr)
 
         s1_prep = self.preprocess_df(s1_df)
         exact_cands = self.retrieve_exact_candidates(s1_prep, indexes)
         self.last_exact_candidates = {s1_id: set(cands.keys()) for s1_id, cands in exact_cands.items()}
         fuzzy_cands = self.retrieve_fuzzy_candidates_for_batch(s1_prep, country_models)
 
-        rows = self.assemble_candidate_rows(s1_prep, exact_cands, fuzzy_cands)
-        cand_grouped = {r.entity_id: [] for r in s1_prep.itertuples(index=False)}
-        for row in rows:
-            if row["candidate_entity_id"]:
-                cand_grouped[row["source1_entity_id"]].append(row["candidate_entity_id"])
-        return cand_grouped
+        cols, cand_ids_by_s1 = self.assemble_candidate_rows(s1_prep, exact_cands, fuzzy_cands)
+        return cand_ids_by_s1
 
     @staticmethod
     def save_candidate_pairs(candidates: Dict[str, List[str]], output_path: str):
@@ -498,6 +634,7 @@ class CandidateBlocker:
         Streams S1 in batches to disk, maintaining low memory usage.
         """
         t_start = time.time()
+        detected_cores = os.cpu_count() or 4
         print("=" * 80)
         print("STARTING FULL-SCALE CANDIDATE BLOCKING (PHASE 1)")
         print(f"  S1: {s1_path}")
@@ -507,6 +644,8 @@ class CandidateBlocker:
         if output_tsv:
             print(f"  Output TSV:     {output_tsv}")
         print(f"  Chunk Size:     {chunk_size:,} S1 entities/batch")
+        print(f"  CPU Hardware    : {detected_cores} logical CPU cores detected | Using {self.n_jobs} active worker cores")
+        print(f"  Parallelization : Multi-processing (loky) for text preprocessing | Multi-threaded BLAS for TF-IDF")
         print("=" * 80)
 
         # 1. Initialize exact inverted indexes
@@ -526,36 +665,55 @@ class CandidateBlocker:
         # Ingestion chunk size for candidate pool (500k at a time to keep RAM minimal)
         INGEST_CHUNK = 500000
 
-        print("\n[Step 1/5] Ingesting and indexing Source 2 candidate pool in streaming chunks...")
+        def _get_line_count(fpath: str) -> Optional[int]:
+            try:
+                with open(fpath, "rb") as f:
+                    return sum(1 for _ in f) - 1
+            except Exception:
+                return None
+
+        total_s2_lines = _get_line_count(s2_path)
+        s2_chunks_est = ((total_s2_lines + INGEST_CHUNK - 1) // INGEST_CHUNK) if total_s2_lines else None
+
+        print(f"\n[Step 1/5] Ingesting and indexing Source 2 candidate pool in streaming chunks (using {self.n_jobs} CPU cores for parallel preprocessing)...", flush=True)
         t0 = time.time()
         total_s2 = 0
+        pbar_s2 = tqdm(total=s2_chunks_est, desc="Step 1/5: Ingesting S2", unit="chunk", file=sys.stdout, dynamic_ncols=True)
         for s2_chunk in pd.read_csv(s2_path, sep="\t", chunksize=INGEST_CHUNK):
             total_s2 += len(s2_chunk)
-            s2_prep = self.preprocess_df(s2_chunk)
+            s2_prep = self.preprocess_df(s2_chunk, n_jobs=self.n_jobs)
             self.index_candidate_chunk(s2_prep, indexes)
             for ctry, grp in s2_prep.groupby("country"):
                 country_eids[ctry].extend(grp["entity_id"].tolist())
                 country_texts[ctry].extend(grp["search_text"].tolist())
             del s2_chunk, s2_prep
             gc.collect()
-        print(f"  Ingested {total_s2:,} S2 records in {time.time() - t0:.2f}s.")
+            pbar_s2.update(1)
+        pbar_s2.close()
+        print(f"  Ingested {total_s2:,} S2 records in {time.time() - t0:.2f}s using {self.n_jobs} CPU cores.", flush=True)
 
-        print("\n[Step 2/5] Ingesting and indexing Source 3 candidate pool in streaming chunks...")
+        total_s3_lines = _get_line_count(s3_path)
+        s3_chunks_est = ((total_s3_lines + INGEST_CHUNK - 1) // INGEST_CHUNK) if total_s3_lines else None
+
+        print(f"\n[Step 2/5] Ingesting and indexing Source 3 candidate pool in streaming chunks (using {self.n_jobs} CPU cores for parallel preprocessing)...", flush=True)
         t0 = time.time()
         total_s3 = 0
+        pbar_s3 = tqdm(total=s3_chunks_est, desc="Step 2/5: Ingesting S3", unit="chunk", file=sys.stdout, dynamic_ncols=True)
         for s3_chunk in pd.read_csv(s3_path, sep="\t", chunksize=INGEST_CHUNK):
             total_s3 += len(s3_chunk)
-            s3_prep = self.preprocess_df(s3_chunk)
+            s3_prep = self.preprocess_df(s3_chunk, n_jobs=self.n_jobs)
             self.index_candidate_chunk(s3_prep, indexes)
             for ctry, grp in s3_prep.groupby("country"):
                 country_eids[ctry].extend(grp["entity_id"].tolist())
                 country_texts[ctry].extend(grp["search_text"].tolist())
             del s3_chunk, s3_prep
             gc.collect()
-        print(f"  Ingested {total_s3:,} S3 records in {time.time() - t0:.2f}s.")
-        print(f"  Total candidate pool: {total_s2 + total_s3:,} entities indexed.")
+            pbar_s3.update(1)
+        pbar_s3.close()
+        print(f"  Ingested {total_s3:,} S3 records in {time.time() - t0:.2f}s using {self.n_jobs} CPU cores.", flush=True)
+        print(f"  Total candidate pool: {total_s2 + total_s3:,} entities indexed across 6 inverted index channels.", flush=True)
 
-        print("\n[Step 3/5] Fitting country-partitioned TF-IDF matrices over candidate pool...")
+        print(f"\n[Step 3/5] Fitting country-partitioned TF-IDF matrices over candidate pool (using {self.n_jobs} CPU cores)...", flush=True)
         t0 = time.time()
         country_models = {}
         for ctry in list(country_texts.keys()):
@@ -573,13 +731,21 @@ class CandidateBlocker:
                 dtype=np.float32,
             )
             X_other = vectorizer.fit_transform(texts)
+            n_records = X_other.shape[0]
+            n_features = X_other.shape[1]
+            nnz = X_other.nnz
             del texts, country_texts[ctry]
             gc.collect()
 
-            country_models[ctry] = (vectorizer, X_other, eids_arr)
-            print(f"  Country '{ctry}': {X_other.shape[0]:,} records, {X_other.shape[1]:,} features, {X_other.nnz:,} non-zeros.")
+            # Precompute transposed matrix once so we never transpose inside the loop!
+            X_other_T = X_other.T.tocsr()
+            del X_other
+            gc.collect()
 
-        print(f"  All TF-IDF matrices built in {time.time() - t0:.2f}s.")
+            country_models[ctry] = (vectorizer, X_other_T, eids_arr)
+            print(f"  Country '{ctry}': {n_records:,} records, {n_features:,} features, {nnz:,} non-zeros (pre-transposed).", flush=True)
+
+        print(f"  All TF-IDF matrices built in {time.time() - t0:.2f}s using {self.n_jobs} CPU cores.", flush=True)
         del country_texts, country_eids
         gc.collect()
 
@@ -587,7 +753,7 @@ class CandidateBlocker:
         gt_map = {}
         total_gt_pairs = 0
         if ground_truth_path and os.path.exists(ground_truth_path):
-            print(f"\n[Step 4/5] Loading ground truth pairs for real-time recall ceiling tracking...")
+            print(f"\n[Step 4/5] Loading ground truth pairs for real-time recall ceiling tracking (using 1 CPU core - I/O bound)...", flush=True)
             t0 = time.time()
             gt_df = pd.read_csv(ground_truth_path, sep="\t")
             match_col = "matched_entity_ids" if "matched_entity_ids" in gt_df.columns else "matched_entity_id"
@@ -601,7 +767,7 @@ class CandidateBlocker:
                     total_gt_pairs += len(matches)
             del gt_df
             gc.collect()
-            print(f"  Loaded {len(gt_map):,} true S1 matches ({total_gt_pairs:,} total true pairs) in {time.time() - t0:.2f}s.")
+            print(f"  Loaded {len(gt_map):,} true S1 matches ({total_gt_pairs:,} total true pairs) in {time.time() - t0:.2f}s.", flush=True)
 
         # Prepare streaming output writers
         os.makedirs(os.path.dirname(os.path.abspath(output_parquet)), exist_ok=True)
@@ -614,13 +780,24 @@ class CandidateBlocker:
             tsv_f.write("source1_entity_id\tcandidate_entity_ids\n")
 
         # 2. Stream S1 in batches
-        print(f"\n[Step 5/5] Processing Source 1 in chunks of {chunk_size:,}...")
+        total_s1_lines = _get_line_count(s1_path)
+        total_batches = ((total_s1_lines + chunk_size - 1) // chunk_size) if total_s1_lines else None
+        batch_info = f"(Total ~{total_batches} batches)" if total_batches else ""
+        print(f"\n[Step 5/5] Processing Source 1 in chunks of {chunk_size:,} {batch_info} (using {self.n_jobs} CPU worker cores across all sub-stages)...", flush=True)
+
+        pbar = tqdm(
+            total=total_batches,
+            desc=f"Stage 5/5: Blocking S1",
+            unit="batch",
+            dynamic_ncols=True,
+            file=sys.stdout,
+        )
+
         batch_idx = 0
         total_s1_records = 0
         total_candidate_pairs = 0
         total_zero_candidates = 0
         running_true_retrieved = 0
-        cand_counts_all = []
 
         country_stats = defaultdict(lambda: {"total": 0, "pairs": 0, "zeros": 0})
 
@@ -629,114 +806,149 @@ class CandidateBlocker:
             batch_idx += 1
             n_batch = len(s1_chunk)
             total_s1_records += n_batch
+            batch_str = f"{batch_idx:03d}/{total_batches:03d}" if total_batches else f"{batch_idx:03d}"
 
-            s1_prep = self.preprocess_df(s1_chunk)
+            print(f"\n  ----------------------------------------------------------------------------", flush=True)
+            print(f"  --- STARTING BATCH {batch_str}: {n_batch:,} S1 entities ---", flush=True)
+            print(f"  ----------------------------------------------------------------------------", flush=True)
 
-            # Query exact indexes
+            # Sub-step 1/4: S1 Preprocessing
+            print(f"  [Batch {batch_str} - 1/4] Preprocessing {n_batch:,} S1 records (using {self.n_jobs} CPU worker processes)...", flush=True)
+            t_prep_start = time.time()
+            s1_prep = self.preprocess_df(s1_chunk, n_jobs=self.n_jobs)
+            t_prep = time.time() - t_prep_start
+            rate_prep = n_batch / t_prep if t_prep > 0 else 0
+            print(f"  [Batch {batch_str} - 1/4] Preprocessing completed: {n_batch:,} records in {t_prep:.2f}s ({rate_prep:,.0f} records/s)", flush=True)
+
+            # Sub-step 2/4: Exact inverted index lookups
+            print(f"  [Batch {batch_str} - 2/4] Querying 6 exact inverted index channels (using {self.n_jobs} CPU cores / hash maps)...", flush=True)
+            t_exact_start = time.time()
             exact_candidates = self.retrieve_exact_candidates(s1_prep, indexes)
+            t_exact = time.time() - t_exact_start
+            n_with_exact = sum(1 for cands in exact_candidates.values() if cands)
+            n_exact_pairs = sum(len(cands) for cands in exact_candidates.values())
+            print(f"  [Batch {batch_str} - 2/4] Exact matching completed in {t_exact:.2f}s | {n_with_exact:,}/{n_batch:,} S1 found exact candidates ({n_exact_pairs:,} total pairs)", flush=True)
 
-            # Query fuzzy matrices
-            fuzzy_candidates = self.retrieve_fuzzy_candidates_for_batch(s1_prep, country_models)
+            # Sub-step 3/4: Multi-core fuzzy TF-IDF candidate retrieval with intra-batch progress
+            print(f"  [Batch {batch_str} - 3/4] Running multi-core fuzzy TF-IDF matching across countries (using {self.n_jobs} CPU cores, subchunk size: {self.subchunk_size})...", flush=True)
+            t_fuzzy_start = time.time()
+            fuzzy_candidates = self.retrieve_fuzzy_candidates_for_batch(
+                s1_prep,
+                country_models,
+                subchunk_size=self.subchunk_size,
+                n_jobs=self.n_jobs,
+                batch_idx=batch_idx,
+                total_batches=total_batches,
+            )
+            t_fuzzy = time.time() - t_fuzzy_start
+            rate_fuzzy = n_batch / t_fuzzy if t_fuzzy > 0 else 0
+            print(f"  [Batch {batch_str} - 3/4] Fuzzy matching completed in {t_fuzzy:.2f}s ({rate_fuzzy:,.0f} S1/s across {self.n_jobs} cores)", flush=True)
 
-            # Assemble candidate rows
-            rows = self.assemble_candidate_rows(s1_prep, exact_candidates, fuzzy_candidates)
-            df_batch = pd.DataFrame(rows)
+            # Sub-step 4/4: Columnar candidate assembly and streaming disk write
+            print(f"  [Batch {batch_str} - 4/4] Merging exact & fuzzy candidates into columnar PyArrow format and streaming to disk...", flush=True)
+            t_asm_start = time.time()
+            cols, cand_ids_by_s1 = self.assemble_candidate_rows(s1_prep, exact_candidates, fuzzy_candidates)
 
-            # Type casting
-            df_batch["exact_ch1_core_name"] = df_batch["exact_ch1_core_name"].astype("int8")
-            df_batch["exact_ch2_sorted_tokens"] = df_batch["exact_ch2_sorted_tokens"].astype("int8")
-            df_batch["exact_ch3_state_prefix"] = df_batch["exact_ch3_state_prefix"].astype("int8")
-            df_batch["exact_ch4_state_phonetic"] = df_batch["exact_ch4_state_phonetic"].astype("int8")
-            df_batch["exact_ch5_acronym"] = df_batch["exact_ch5_acronym"].astype("int8")
-            df_batch["exact_ch6_address_tokens"] = df_batch["exact_ch6_address_tokens"].astype("int8")
-            df_batch["tfidf_cosine_score"] = df_batch["tfidf_cosine_score"].astype("float32")
-
-            n_pairs = len(df_batch[df_batch["candidate_entity_id"].notna()])
+            # Calculate batch pair statistics directly from dictionary
+            batch_zeros = sum(1 for cands in cand_ids_by_s1.values() if not cands)
+            n_pairs = sum(len(cands) for cands in cand_ids_by_s1.values())
             total_candidate_pairs += n_pairs
-
-            # Stream directly to Parquet file
-            table = pa.Table.from_pandas(df_batch, schema=CANDIDATE_PA_SCHEMA, preserve_index=False)
-            parquet_writer.write_table(table)
-
-            # Stream TSV if requested
-            if tsv_f is not None:
-                # Group candidates for this batch
-                valid_b = df_batch[df_batch["candidate_entity_id"].notna()]
-                cand_grouped = valid_b.groupby("source1_entity_id")["candidate_entity_id"].apply(lambda x: ",".join(x)).to_dict()
-                for s1_id in s1_chunk["entity_id"]:
-                    cand_str = cand_grouped.get(s1_id, "")
-                    tsv_f.write(f"{s1_id}\t{cand_str}\n")
-
-            # Track ground truth recall if available
-            if gt_map:
-                valid_b = df_batch[df_batch["candidate_entity_id"].notna()]
-                b_cands_by_s1 = valid_b.groupby("source1_entity_id")["candidate_entity_id"].apply(set).to_dict()
-                for s1_id, true_set in gt_map.items():
-                    if s1_id in b_cands_by_s1:
-                        running_true_retrieved += len(true_set.intersection(b_cands_by_s1[s1_id]))
-
-            # Batch stats
-            batch_zeros = len(df_batch[df_batch["candidate_entity_id"].isna()])
             total_zero_candidates += batch_zeros
 
-            # Country stats update
-            for ctry, grp in s1_prep.groupby("country"):
-                country_stats[ctry]["total"] += len(grp)
-                b_valid_ctry = df_batch[(df_batch["country"] == ctry) & (df_batch["candidate_entity_id"].notna())]
-                country_stats[ctry]["pairs"] += len(b_valid_ctry)
-                b_zero_ctry = df_batch[(df_batch["country"] == ctry) & (df_batch["candidate_entity_id"].isna())]
-                country_stats[ctry]["zeros"] += len(b_zero_ctry)
+            # Build PyArrow Table directly from columns without converting to pandas DataFrame
+            table = pa.Table.from_pydict(cols, schema=CANDIDATE_PA_SCHEMA)
+            parquet_writer.write_table(table)
+
+            # Stream TSV deliverable directly from dictionary in 0.02s
+            if tsv_f is not None:
+                for s1_id in s1_chunk["entity_id"]:
+                    cand_list = cand_ids_by_s1.get(s1_id, [])
+                    tsv_f.write(f"{s1_id}\t{','.join(cand_list)}\n")
+                tsv_f.flush()
+
+            t_asm = time.time() - t_asm_start
+            print(f"  [Batch {batch_str} - 4/4] Assembly & disk writes completed in {t_asm:.2f}s", flush=True)
+
+            # Track ground truth recall if available in 0.01s without pandas groupby
+            if gt_map:
+                for s1_id in s1_chunk["entity_id"]:
+                    if s1_id in gt_map:
+                        true_set = gt_map[s1_id]
+                        cand_set = set(cand_ids_by_s1.get(s1_id, []))
+                        running_true_retrieved += len(true_set.intersection(cand_set))
+
+            # Country stats update directly from s1_prep and cand_ids_by_s1
+            country_map = dict(zip(s1_prep["entity_id"], s1_prep["country"]))
+            for s1_id, cands in cand_ids_by_s1.items():
+                ctry = country_map.get(s1_id, "UNKNOWN")
+                country_stats[ctry]["total"] += 1
+                country_stats[ctry]["pairs"] += len(cands)
+                if not cands:
+                    country_stats[ctry]["zeros"] += 1
 
             recall_str = ""
             if total_gt_pairs > 0:
                 cur_recall = (running_true_retrieved / total_gt_pairs) * 100
                 recall_str = f" | Recall Ceiling: {cur_recall:.3f}%"
 
-            print(f"  Batch {batch_idx:03d}: {n_batch:,} S1 | Pairs: {n_pairs:,} (avg {n_pairs/n_batch:.1f}/S1) | 0-cands: {batch_zeros} | Elapsed: {time.time() - t_batch:.1f}s{recall_str}")
+            batch_elapsed = time.time() - t_batch
+            print(
+                f"  Batch {batch_str} COMPLETE: {n_batch:,} S1 | Pairs: {n_pairs:,} (avg {n_pairs/n_batch:.1f}/S1) | 0-cands: {batch_zeros} | Elapsed: {batch_elapsed:.1f}s{recall_str}\n",
+                flush=True,
+            )
 
-            del s1_prep, exact_candidates, fuzzy_candidates, rows, df_batch, table
+            pbar.update(1)
+            pbar.set_postfix({
+                "batch": batch_str,
+                "elapsed": f"{batch_elapsed:.1f}s",
+                "avg_cand": f"{total_candidate_pairs/total_s1_records:.1f}",
+            })
+
+            del s1_prep, exact_candidates, fuzzy_candidates, cols, cand_ids_by_s1, table
             gc.collect()
+
+        pbar.close()
 
         # Close streams
         parquet_writer.close()
         if tsv_f is not None:
             tsv_f.close()
-            print(f"TSV deliverable written to {output_tsv}.")
+            print(f"TSV deliverable written to {output_tsv}.", flush=True)
 
         del indexes, country_models
         gc.collect()
 
         # Final validation report
-        print("\n" + "=" * 80)
-        print("FULL BLOCKING RUN COMPLETE — SUMMARY AUDIT")
-        print("=" * 80)
-        print(f"Total S1 entities processed: {total_s1_records:,}")
-        print(f"Total valid candidate pairs: {total_candidate_pairs:,}")
-        print(f"Average candidates per S1:   {total_candidate_pairs / total_s1_records:.2f}")
-        print(f"Entities with 0 candidates:  {total_zero_candidates:,} ({total_zero_candidates / total_s1_records * 100:.4f}%)")
+        print("\n" + "=" * 80, flush=True)
+        print("FULL BLOCKING RUN COMPLETE — SUMMARY AUDIT", flush=True)
+        print("=" * 80, flush=True)
+        print(f"Total S1 entities processed: {total_s1_records:,}", flush=True)
+        print(f"Total valid candidate pairs: {total_candidate_pairs:,}", flush=True)
+        print(f"Average candidates per S1:   {total_candidate_pairs / total_s1_records:.2f}", flush=True)
+        print(f"Entities with 0 candidates:  {total_zero_candidates:,} ({total_zero_candidates / total_s1_records * 100:.4f}%)", flush=True)
 
-        print("\nPer-Country Distribution:")
+        print("\nPer-Country Distribution:", flush=True)
         for ctry, stats in country_stats.items():
             tot = stats["total"]
             pairs = stats["pairs"]
             zeros = stats["zeros"]
             avg_p = pairs / tot if tot > 0 else 0
-            print(f"  Country '{ctry}': {tot:,} S1 | {pairs:,} pairs (avg {avg_p:.1f}/S1) | {zeros:,} zero-cands ({zeros/tot*100:.3f}%)")
+            print(f"  Country '{ctry}': {tot:,} S1 | {pairs:,} pairs (avg {avg_p:.1f}/S1) | {zeros:,} zero-cands ({zeros/tot*100:.3f}%)", flush=True)
 
         if total_gt_pairs > 0:
             final_recall = (running_true_retrieved / total_gt_pairs) * 100
-            print(f"\nGROUND TRUTH RECALL CEILING:")
-            print(f"  Total True Pairs:    {total_gt_pairs:,}")
-            print(f"  Retrieved by Blocker:{running_true_retrieved:,}")
-            print(f"  Missed by Blocker:   {total_gt_pairs - running_true_retrieved:,}")
-            print(f"  RECALL CEILING:      {final_recall:.3f}%")
+            print(f"\nGROUND TRUTH RECALL CEILING:", flush=True)
+            print(f"  Total True Pairs:    {total_gt_pairs:,}", flush=True)
+            print(f"  Retrieved by Blocker:{running_true_retrieved:,}", flush=True)
+            print(f"  Missed by Blocker:   {total_gt_pairs - running_true_retrieved:,}", flush=True)
+            print(f"  RECALL CEILING:      {final_recall:.3f}%", flush=True)
             if final_recall >= 99.0:
-                print(f"  ✅ PASS: Recall ceiling is {final_recall:.2f}% (exceeds 99.0% target).")
+                print(f"  ✅ PASS: Recall ceiling is {final_recall:.2f}% (exceeds 99.0% target).", flush=True)
             else:
-                print(f"  ⚠️ WARNING: Recall ceiling is {final_recall:.2f}%.")
+                print(f"  ⚠️ WARNING: Recall ceiling is {final_recall:.2f}%.", flush=True)
 
-        print(f"\nParquet file saved to: {output_parquet} (size: {os.path.getsize(output_parquet) / (1024*1024):.1f} MB)")
-        print(f"TOTAL EXECUTION TIME: {time.time() - t_start:.2f}s")
+        print(f"\nParquet file saved to: {output_parquet} (size: {os.path.getsize(output_parquet) / (1024*1024):.1f} MB)", flush=True)
+        print(f"TOTAL EXECUTION TIME: {time.time() - t_start:.2f}s", flush=True)
 
 
 if __name__ == "__main__":

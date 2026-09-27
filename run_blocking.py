@@ -44,18 +44,27 @@ LEGACY_SRC = os.path.join(SCRIPT_DIR, "code", "business_entity_resolution")
 if os.path.isdir(LEGACY_SRC):
     sys.path.insert(1, LEGACY_SRC)
 
-# ---------------------------------------------------------------------------
-# Hardcoded paths — update these if your layout changes.
-# Colab layout:
-#   /content/
-#     ml-hack/          ← this script lives here
-#       src/, configs/, output/, ...
-#     student_resource/
-#       dataset/
-#         train/  test/
-# ---------------------------------------------------------------------------
-DEFAULT_DATA_DIR   = "/content/ml-hack/student_resource/dataset"
-DEFAULT_OUTPUT_DIR = "/content/ml-hack/output"
+def _detect_default_data_dir():
+    candidates = [
+        os.path.join(SCRIPT_DIR, "dataset"),
+        os.path.join(SCRIPT_DIR, "student_resource", "dataset"),
+        "/content/ml-hack/student_resource/dataset",
+        "/content/dataset",
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and (os.path.isdir(os.path.join(c, "train")) or os.path.isdir(os.path.join(c, "test"))):
+            return c
+    return os.path.join(SCRIPT_DIR, "dataset")
+
+
+def _detect_default_output_dir():
+    if os.path.exists("/content"):
+        return "/content/ml-hack/output"
+    return os.path.join(SCRIPT_DIR, "output")
+
+
+DEFAULT_DATA_DIR   = _detect_default_data_dir()
+DEFAULT_OUTPUT_DIR = _detect_default_output_dir()
 
 # ---------------------------------------------------------------------------
 # Dependency check + optional auto-install

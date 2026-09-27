@@ -423,6 +423,65 @@ class CandidateBlocker:
 
         return rows
 
+    def generate_candidate_pairs(
+        self, s1_df: pd.DataFrame, other_df: pd.DataFrame, verbose: bool = False
+    ) -> Dict[str, List[str]]:
+        """
+        In-memory candidate generation for testing or small DataFrames.
+        Returns dict: s1_id -> list of candidate entity_ids.
+        """
+        indexes = {
+            "core_name": defaultdict(list),
+            "sorted_tokens": defaultdict(list),
+            "state_pfx": defaultdict(list),
+            "state_phon": defaultdict(list),
+            "acronym": defaultdict(list),
+            "sorted_addr": defaultdict(list),
+        }
+        country_texts = defaultdict(list)
+        country_eids = defaultdict(list)
+
+        other_prep = self.preprocess_df(other_df)
+        self.index_candidate_chunk(other_prep, indexes)
+        for ctry, grp in other_prep.groupby("country"):
+            country_eids[ctry].extend(grp["entity_id"].tolist())
+            country_texts[ctry].extend(grp["search_text"].tolist())
+
+        country_models = {}
+        for ctry in country_texts:
+            texts = country_texts[ctry]
+            eids_arr = np.array(country_eids[ctry])
+            min_df_val = 1 if len(texts) < 10 else 2
+            vectorizer = TfidfVectorizer(
+                analyzer="char_wb",
+                ngram_range=self.ngram_range,
+                min_df=min_df_val,
+                sublinear_tf=True,
+                dtype=np.float32,
+            )
+            X_other = vectorizer.fit_transform(texts)
+            country_models[ctry] = (vectorizer, X_other, eids_arr)
+
+        s1_prep = self.preprocess_df(s1_df)
+        exact_cands = self.retrieve_exact_candidates(s1_prep, indexes)
+        self.last_exact_candidates = {s1_id: set(cands.keys()) for s1_id, cands in exact_cands.items()}
+        fuzzy_cands = self.retrieve_fuzzy_candidates_for_batch(s1_prep, country_models)
+
+        rows = self.assemble_candidate_rows(s1_prep, exact_cands, fuzzy_cands)
+        cand_grouped = {r.entity_id: [] for r in s1_prep.itertuples(index=False)}
+        for row in rows:
+            if row["candidate_entity_id"]:
+                cand_grouped[row["source1_entity_id"]].append(row["candidate_entity_id"])
+        return cand_grouped
+
+    @staticmethod
+    def save_candidate_pairs(candidates: Dict[str, List[str]], output_path: str):
+        """Save candidates dictionary to submission-ready TSV."""
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("source1_entity_id\tcandidate_entity_ids\n")
+            for s1_id, cands in candidates.items():
+                f.write(f"{s1_id}\t{','.join(cands)}\n")
+
     def run_batched_blocking(
         self,
         s1_path: str,

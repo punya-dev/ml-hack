@@ -328,8 +328,8 @@ def parse_args():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=50000,
-        help="S1 batch chunk size (50k ~= 2 min/batch locally; increase to 100k on GPU server).",
+        default=100000,
+        help="S1 batch chunk size (100,000 for fast server execution).",
     )
     parser.add_argument(
         "--threshold",

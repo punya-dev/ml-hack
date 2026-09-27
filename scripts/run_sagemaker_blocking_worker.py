@@ -26,7 +26,7 @@ def main():
     parser.add_argument("--data-dir", default="/opt/ml/processing/input/data", help="Data directory")
     parser.add_argument("--code-dir", default="/opt/ml/processing/input/code", help="Code directory")
     parser.add_argument("--output-dir", default="/opt/ml/processing/output", help="Output directory")
-    parser.add_argument("--chunk-size", type=int, default=50000, help="S1 batch chunk size")
+    parser.add_argument("--chunk-size", type=int, default=100000, help="S1 batch chunk size")
     parser.add_argument("--threshold", type=float, default=0.24, help="Fuzzy TF-IDF cosine threshold")
     parser.add_argument("--max-fuzzy", type=int, default=50, help="Max fuzzy candidates per S1 entity")
     parser.add_argument("--max-total", type=int, default=80, help="Max total candidates per S1 entity")

@@ -19,16 +19,19 @@ Pipeline Stages:
   Stage 4: Submission Format Verification (via utils/validate_submission.py)
 
 Usage:
-  # 1. Run full train blocking (with recall ceiling audit):
+  # 1. Run full train & test blocking (default, 100,000 batch size):
+  python pipeline_raw_to_blocking.py
+
+  # 2. Run train blocking only (with recall ceiling audit):
   python pipeline_raw_to_blocking.py --mode train
 
-  # 2. Run validation pipeline (creates val split then blocks & evaluates):
+  # 3. Run validation pipeline (creates val split then blocks & evaluates):
   python pipeline_raw_to_blocking.py --mode val --create-val
 
-  # 3. Run test blocking (creates candidate_pairs.tsv for inference):
+  # 4. Run test blocking only (creates candidate_pairs.tsv for inference):
   python pipeline_raw_to_blocking.py --mode test
 
-  # 4. Run all (train, val, test):
+  # 5. Run all (train, val, test):
   python pipeline_raw_to_blocking.py --mode all --create-val
 =============================================================================
 """
@@ -112,11 +115,11 @@ def preflight_check(data_dir: str, output_dir: str, mode: str, create_val: bool)
         if not exists:
             train_missing.append(fpath)
 
-    if (mode in ("train", "val", "all") or create_val) and train_missing:
+    if (mode in ("train", "val", "all", "both") or create_val) and train_missing:
         raise FileNotFoundError(f"Missing required raw train files in {train_dir}: {train_missing}")
 
     # Check test files if test mode
-    if mode in ("test", "all"):
+    if mode in ("test", "all", "both"):
         test_dir = os.path.join(data_dir, "test")
         raw_test_files = [
             "test_source1.tsv",
@@ -367,9 +370,9 @@ def parse_args():
     )
     parser.add_argument(
         "--mode",
-        choices=["train", "val", "test", "all"],
-        default="train",
-        help="Which split to block: 'train', 'val', 'test', or 'all'.",
+        choices=["train", "val", "test", "both", "all"],
+        default="both",
+        help="Which split to block: 'both' (train + test), 'train', 'val', 'test', or 'all'.",
     )
     parser.add_argument(
         "--data-dir",
@@ -396,8 +399,8 @@ def parse_args():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=50000,
-        help="Batch chunk size for S1 streaming.",
+        default=100000,
+        help="Batch chunk size for S1 streaming (100,000 for fast server execution).",
     )
     parser.add_argument(
         "--threshold",
@@ -456,11 +459,16 @@ def main():
         )
 
     # Stage 2 & 3: Run Candidate Blocking
-    modes = ["train"] if args.mode == "train" else (
-        ["val"] if args.mode == "val" else (
-            ["test"] if args.mode == "test" else ["train", "val", "test"]
-        )
-    )
+    if args.mode == "both":
+        modes = ["train", "test"]
+    elif args.mode == "train":
+        modes = ["train"]
+    elif args.mode == "val":
+        modes = ["val"]
+    elif args.mode == "test":
+        modes = ["test"]
+    else:  # all
+        modes = ["train", "val", "test"]
 
     for m in modes:
         run_stage_blocking(

@@ -489,7 +489,7 @@ class CandidateBlocker:
         s3_path: str,
         output_parquet: str,
         output_tsv: Optional[str] = None,
-        chunk_size: int = 50000,
+        chunk_size: int = 100000,
         ground_truth_path: Optional[str] = None,
         verbose: bool = True,
     ):

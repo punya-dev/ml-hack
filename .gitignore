@@ -1,6 +1,9 @@
 # Datasets
 dataset/
 
+# Generated outputs
+output/
+
 # Python bytecode & cache
 __pycache__/
 *.py[cod]
